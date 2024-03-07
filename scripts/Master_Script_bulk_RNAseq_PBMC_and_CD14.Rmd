@@ -1,0 +1,2444 @@
+---
+title: "Master Script of bulk RNAseq analysis (PBMCs and CD14)"
+author: "Stefanie Warnat-Herresthal & Rainer Knoll"
+date: "15 11 2022"
+output: html_document
+---
+
+
+# 0. Prerequisites 
+
+Libraries etc. 
+```{r, message = F, warning=FALSE}
+library(devtools)
+devtools::load_all(path = "RNA-DESeq2/")
+source("DESEqfunctions_V3.R") # updated functions
+library(readxl)
+library(ggpubr)
+library(ComplexHeatmap)
+library(circlize)
+library(tidyverse)
+library(RColorBrewer)
+library(fgsea)
+library(UpSetR)
+organism = "human" 
+GO_hs <- rbind(GO_hs_1, GO_hs_2)
+```
+
+```{r}
+uDEG_symbol <- function(input = DEresults, comparisons){
+  uDEGs <- NULL
+  tmp <- input[names(input) %in% comparisons]
+  for(i in 1:length(comparisons)){
+    DEGs <- as.data.frame(tmp[[i]]@results[tmp[[i]]@results$regulation %in% c("up","down"),])
+    uDEGs <- unique(c(uDEGs, DEGs$SYMBOL))
+  }
+  uDEGs
+}
+
+```
+
+
+# 1. Quality and Meta-information
+
+RNAseq sample annotation
+
+RNAseq annotation
+```{r, message=F}
+sample_table <- read_xlsx("../Files//HIV_pilot_metadata.xlsx")
+
+## Add columns with factors for comparisons in model
+sample_table$condition <- factor(sample_table$disease,
+                                 levels = c("ctrl", "HIV"))
+
+# order according to factor of interest
+sample_table <- sample_table[order(sample_table$condition),]
+
+# define factor for order of samples in plotting 
+plot_order <- "condition"
+
+rownames(sample_table) <- paste(sample_table$donor, sample_table$sorting, sep = "_")
+
+sample_table$seq_id <- as.character(sample_table$ID)
+```
+
+Quality check
+Fastq QC
+
+Read and visualize fastQC MultiQC output. 
+
+For many projects, multiple sequencing runs are necessary to get a satisfactory sequencing depth for all samples. Furthermore, samples can be distributed onto multiple lanes of a flowcell.Since the quality of each single run and lane can differ, we want to look at all fastq files from all runs and lanes seperately.
+
+For more information on fastQC, please check: https://www.bioinformatics.babraham.ac.uk/projects/fastqc/
+
+```{r, eval = T}
+fastq_qc <- read.delim("../Data/bulk_RNA_PBMC_CD14/20190823_hisat2_truseq/qc/multiqc/fastqc_data/multiqc_fastqc.txt", stringsAsFactors = F)
+fastq_qc$ID <- unlist(lapply(strsplit(fastq_qc$Sample, split = "_"), `[[`, 1)) # sample identifiers
+rownames(fastq_qc) <- fastq_qc$ID
+```
+
+Visualization: **Heatmap of fastQC quality checks**
+
+```{r, fig.height=3, fig.width=10, eval = T}
+fastQC_HC <- t(fastq_qc[,colnames(fastq_qc) %in% c("per_base_sequence_quality",
+                                              "per_sequence_quality_scores",
+                                              "per_base_sequence_content",
+                                              "per_sequence_gc_content",
+                                              "per_base_n_content",
+                                              "sequence_length_distribution",
+                                              "sequence_duplication_levels",
+                                              "overrepresented_sequences",
+                                              "adapter_content")])
+
+draw(Heatmap(fastQC_HC,
+        c("firebrick2", "forestgreen", "goldenrod1"),
+        column_title = "FastQC results"),
+     heatmap_legend_side = "left")
+```
+
+Hisat2 QC
+
+```{r Kallisto QC import}
+hisat_qc <- read.delim("../Data/bulk_RNA_PBMC_CD14/20190823_hisat2_truseq/qc/multiqc/summary_data/multiqc_hisat2.txt", stringsAsFactors = F)
+
+# Merge to sample table
+sample_table <- merge(sample_table, hisat_qc, by.x = "ID", by.y = "Sample", all = T)
+sample_table <- na.omit(sample_table)
+rownames(sample_table) <- sample_table$ID
+```
+
+```{r, fig.height = 10}
+alignstat <-sample_table[,c("ID", "unpaired_aligned_one","unpaired_total")]
+alignstat <-gather(alignstat, "unpaired_aligned_one", "unpaired_total", key = "type", value = "reads")
+
+p1 <- ggplot(alignstat, aes(x = reorder(ID,-reads), y = reads, fill = type)) + 
+  geom_bar(stat = "identity", position = "dodge", colour = "black") + 
+  scale_y_continuous(breaks = c(c(5 , 10, 25, 50, 100) * 10^6))+
+  scale_fill_manual(name = "", values = c("white", "grey")) + 
+  ylab("Reads") + 
+  xlab("Sample IDs") + 
+  geom_hline(yintercept=5 * 10^6, linetype="dashed", color = "red") +
+  ggtitle("Total reads and uniquely aligned reads") +
+  theme(axis.text.x = element_text(angle = 70, size = 9, hjust = 1, vjust = 1), 
+        strip.background = element_rect(fill = "white"), 
+        panel.background = element_rect(fill = "white", colour = "black"), 
+        legend.position = "bottom"
+  )
+
+alignstat <-sample_table[,c("ID", "unpaired_aligned_one","unpaired_aligned_multi", "unpaired_aligned_none")]
+alignstat <-gather(alignstat, "unpaired_aligned_one","unpaired_aligned_multi", "unpaired_aligned_none", key = "type", value = "reads")
+
+p2 <- ggplot(alignstat, aes(x = reorder(ID,-reads), y = reads, fill = type)) + 
+  geom_bar(stat = "identity", colour = "black") + 
+  scale_y_continuous(breaks = c(c(5 , 10, 25, 50, 100) * 10^6))+
+  ylab("Reads") + 
+  xlab("Sample IDs") + 
+  geom_hline(yintercept=5 * 10^6, linetype="dashed", color = "red") +
+  ggtitle("Hisat2 alignment scores") +
+  theme(axis.text.x = element_text(angle = 70, size = 9, hjust = 1, vjust = 1), 
+        strip.background = element_rect(fill = "white"), 
+        panel.background = element_rect(fill = "white", colour = "black"), 
+        legend.position = "bottom"
+  )
+
+ggarrange(p1, p2, nrow = 2)
+```
+
+Plot annotations and colours
+
+```{r}
+# choose columns from sampletable for heatmap annotation
+plot_annotation <- sample_table[,c("donor", "disease","ID", "sorting", "age", "overall_alignment_rate")]
+plot_annotation$sorting <- as.factor(plot_annotation$sorting)
+plot_annotation$donor <- factor(plot_annotation$donor, levels = c("CTRL01", "CTRL02", "CTRL03", "CTRL04", "CTRL05", 
+                                                                        "HIV01", "HIV03", "HIV02", "HIV04", "HIV05")) 
+plot_annotation$disease <- as.factor(plot_annotation$disease)
+rownames(plot_annotation) <- rownames(sample_table)
+```
+
+```{r}
+ann_colors <- list(
+    disease = setNames(c("#6BAED6", "#FB6A4A"), 
+                       c("ctrl", "HIV")),
+    donor = setNames(c(brewer.pal(n = 5, name = "Blues"), c(brewer.pal(n = 5, name = "Reds"))),
+                     levels(plot_annotation$donor)),
+    sorting  = setNames(c("#E41A1C", "#377EB8", "purple"),
+                     unique(plot_annotation$sorting))
+)
+
+ 
+col_patient<-c("NL01"="#eff3ff","NL02"="#feedde","NL03"="#bdd7e7","NL04"="#fdbe85","NL05"="#6baed6","NL06"="#fd8d3c", "NL07"="#3182bd","NL08"="#e6550d","NL09"="#08519c","NL10"="#a63603")
+```
+
+```{r}
+rm(alignstat, fastq_qc, fastQC_HC, hisat_qc, p1, p2, col_patient)
+```
+
+
+# 2. all samples 
+
+2.1. Data import & DEseq object
+
+```{r}
+cts <- read.delim("../Data/bulk_RNA_PBMC_CD14/20190823_hisat2_truseq/counts/merged.tsv")
+
+colnames(cts) <- gsub(colnames(cts), pattern = "X", replacement = "")
+rownames(cts) <- cts$EnsembleID
+cts$EnsembleID <- NULL
+
+# remove qc at the end
+cts <- cts[-c(58348:58352),]
+
+# check if sample table and counts are in the same order!
+identical(sample_table$seq_id, colnames(cts))
+cts <- cts[,sample_table$seq_id]
+identical(sample_table$seq_id, colnames(cts))
+colnames(cts) <- rownames(sample_table)
+
+ddsHTSeq <- DESeqDataSetFromMatrix(countData = cts,
+                                       colData  = sample_table,
+                                       design= ~ condition)
+ddsHTSeq
+```
+
+Pre-filtering
+
+```{r}
+genes_to_keep <- rowSums(counts(ddsHTSeq)) >= 10
+dds <- ddsHTSeq[genes_to_keep,]
+rm(ddsHTSeq)
+```
+
+
+DESeq calculations
+
+```{r }
+dds <- DESeq(dds)
+```
+
+Normalized count table  
+
+For inspection of the normalized data, we write the normalized counts into a data.frame called "norm_anno".
+
+```{r }
+norm_anno <- as.data.frame(counts(dds, normalized=T))
+norm_anno$GENEID <- row.names(norm_anno)
+
+# add gene annotation extracted from the gtf file
+gene_annotation <- DESeqtools::tx_annotation_v27_human[!duplicated(DESeqtools::tx_annotation_v27_human$GENEID),c("GENEID", "SYMBOL", "GENETYPE")]
+gene_annotation <- gene_annotation[!is.na(gene_annotation$GENEID),]
+gene_annotation <- gene_annotation[match(rownames(norm_anno), gene_annotation$GENEID),]
+
+# check if row names of the normalized table and the gene annotation match perfectly
+all(rownames(norm_anno) == gene_annotation$GENEID)
+biomart <- biomart_human
+
+idx <- match(unlist(lapply(strsplit(gene_annotation$GENEID, split = "[.]"), `[[`, 1)), biomart$Gene.stable.ID)
+gene_annotation$DESCRIPTION <- biomart$Gene.description[idx]
+gene_annotation$CHR <- biomart$Chromosome.scaffold.name[idx]
+
+# merge expression table and annotation
+norm_anno <- merge(norm_anno,
+                   gene_annotation,
+                   by = "GENEID")
+rownames(norm_anno) <- norm_anno$GENEID
+
+norm_anno[1:3,c(1:2, (ncol(norm_anno)-5):ncol(norm_anno))]
+```
+
+Variance stabilizing transformation
+
+```{r }
+dds_vst <- vst(dds, blind = TRUE)
+```
+
+For later plotting of Heatmaps, it may be useful to have a dataframe of the variance stabilized values as log2-transformed (vst_anno_log2) as well as as normal counts (vst_anno):
+
+```{r}
+vst_anno_log2<-as.data.frame(assay(dds_vst))
+vst_anno_log2<-merge(vst_anno_log2,norm_anno[,c("GENEID","SYMBOL","GENETYPE","DESCRIPTION","CHR")],by="row.names")
+rownames(vst_anno_log2)<-vst_anno_log2$Row.names
+vst_anno_log2$Row.names<-NULL
+
+vst_anno<-as.data.frame(assay(dds_vst))
+vst_anno<-2^vst_anno
+vst_anno<-merge(vst_anno,norm_anno[,c("GENEID","SYMBOL","GENETYPE","DESCRIPTION","CHR")],by="row.names")
+rownames(vst_anno)<-vst_anno$Row.names
+vst_anno$Row.names<-NULL
+```
+
+
+Principle Component Analysis 
+  Percentage of explained variance of PCs
+
+```{r}
+# Extract the eigenvalues/variances of the principal dimensions
+eigenvalue <- get_eig(prcomp(t(assay(dds_vst))))
+eigenvalue$dim <- as.numeric(c(1:nrow(eigenvalue)))
+
+ggplot(eigenvalue, aes(dim, variance.percent))+ 
+  geom_bar(stat = "identity")+
+  geom_line(aes(dim, variance.percent)) +
+  geom_point(aes(dim, variance.percent)) +
+  geom_line(aes(dim, cumulative.variance.percent), colour= "grey") + 
+  geom_point(aes(dim, cumulative.variance.percent), colour= "grey") + 
+  scale_x_continuous(breaks=c(1:nrow(eigenvalue)))+
+  xlab("Dimensions") +
+  ylab("Percentage of explained variances") +
+  theme_bw()
+```
+
+Plot PCA 
+
+```{r, fig.width=6, fig.height=6}
+plotPCA(ntop="all", 
+        xPC=1, 
+        yPC=2,
+        color= "sorting",
+        anno_colour = ann_colors$sorting,
+        shape="NULL",
+        point_size=,
+        label= "donor",
+        title="")+ 
+scale_colour_manual(name = "Celltype", values = ann_colors$sorting) + 
+   guides(colour = guide_legend(override.aes = list(size = 5))) 
+```
+
+# 3. PBMC samples
+
+## 3.1. Data import & DESeq object
+
+```{r}
+pbmc_samples <- as.character(sample_table[sample_table$sorting == "PBMC",]$ID)
+```
+
+```{r}
+ddsHTSeq_pbmc <- DESeqDataSetFromMatrix(countData = cts[,pbmc_samples],
+                                       colData  = sample_table[pbmc_samples,],
+                                       design= ~ condition)
+
+ddsHTSeq_pbmc
+```
+
+Pre-filtering
+
+```{r}
+genes_to_keep <- rowSums(counts(ddsHTSeq_pbmc)) >= 10
+dds_pbmc <- ddsHTSeq_pbmc[genes_to_keep,]
+```
+
+**Number of genes after filtering is:** `r sum(genes_to_keep) `
+
+DESeq calculations
+
+```{r}
+dds_pbmc <- DESeq(dds_pbmc)
+```
+
+Normalized count table  
+
+For inspection of the normalized data, we write the normalized counts into a data.frame called "norm_anno".
+
+```{r}
+norm_anno_pbmc <- as.data.frame(counts(dds_pbmc, normalized=T))
+norm_anno_pbmc$GENEID <- row.names(norm_anno_pbmc)
+
+# add gene annotation extracted from the gtf file
+gene_annotation <- DESeqtools::tx_annotation_v27_human[!duplicated(DESeqtools::tx_annotation_v27_human$GENEID),c("GENEID", "SYMBOL", "GENETYPE")]
+gene_annotation <- gene_annotation[!is.na(gene_annotation$GENEID),]
+
+
+gene_annotation <- gene_annotation[match(rownames(norm_anno_pbmc), gene_annotation$GENEID),]
+
+# check if row names of the normalized table and the gene annotation match perfectly
+all(rownames(norm_anno_pbmc) == gene_annotation$GENEID)
+
+biomart <- biomart_human
+
+idx <- match(unlist(lapply(strsplit(gene_annotation$GENEID, split = "[.]"), `[[`, 1)), biomart$Gene.stable.ID)
+gene_annotation$DESCRIPTION <- biomart$Gene.description[idx]
+gene_annotation$CHR <- biomart$Chromosome.scaffold.name[idx]
+
+# merge expression table and annotation
+norm_anno_pbmc <- merge(norm_anno_pbmc,
+                   gene_annotation,
+                   by = "GENEID")
+rownames(norm_anno_pbmc) <- norm_anno_pbmc$GENEID
+
+norm_anno_pbmc[1:3,c(1:2, (ncol(norm_anno_pbmc)-5):ncol(norm_anno_pbmc))]
+```
+
+Variance stabilizing transformation
+
+```{r}
+dds_vst_pbmc <- rlog(dds_pbmc, blind = TRUE)
+```
+
+```{r}
+vst_anno_log2_pbmc<-as.data.frame(assay(dds_vst_pbmc))
+vst_anno_log2_pbmc<-merge(vst_anno_log2_pbmc,norm_anno_pbmc[,c("GENEID","SYMBOL","GENETYPE","DESCRIPTION","CHR")],by="row.names")
+rownames(vst_anno_log2_pbmc)<-vst_anno_log2_pbmc$Row.names
+vst_anno_log2_pbmc$Row.names<-NULL
+
+vst_anno_pbmc<-as.data.frame(assay(dds_vst_pbmc))
+vst_anno_pbmc<-2^vst_anno_pbmc
+vst_anno_pbmc<-merge(vst_anno_pbmc,norm_anno_pbmc[,c("GENEID","SYMBOL","GENETYPE","DESCRIPTION","CHR")],by="row.names")
+rownames(vst_anno_pbmc)<-vst_anno_pbmc$Row.names
+vst_anno_pbmc$Row.names<-NULL
+```
+
+
+Plot row standard deviations versus row means
+
+```{r}
+meanSdPlot(as.matrix(assay(dds_vst_pbmc)), ranks = FALSE)
+```
+
+
+
+## 3.2. Exploratory Data Analysis
+
+Frequencies of gene types
+
+```{r}
+TypeCounts <- as.data.frame(table(norm_anno_pbmc$GENETYPE))
+colnames(TypeCounts) <- c("Type", "Frequency")
+TypeCounts <- subset(TypeCounts, Frequency>0)
+
+ggplot(TypeCounts, aes(x=Type, y= Frequency,  label=Frequency))+
+  geom_bar(stat="identity",fill="grey",colour="grey") +
+  theme_bw()+
+  geom_text(size = 3, position = position_stack(vjust = 1))+
+  guides(fill=FALSE)+
+  theme(text = element_text(size=10),axis.text.x = element_text(angle =90, hjust = 1))+
+  xlab("")
+rm(TypeCounts)
+```
+
+Histogram of of means per gene over all samples
+
+```{r}
+rMeans <- as.data.frame(log(rowMeans(counts(dds_pbmc, normalized=TRUE)),10))
+colnames(rMeans) <- "rowMeans"
+ggplot(rMeans, aes(x = rowMeans)) + 
+  geom_histogram(bins=100) +
+  xlab("log10(rowMeans)")+
+  scale_x_continuous(breaks=c(0,1,2,3,4,5,6))+
+  theme_bw()
+rm(rMeans)
+```
+
+Boxplots of highest expressed genes
+
+```{r, fig.height=8, fig.width=8}
+highestGenes(data = norm_anno_pbmc, numGenes = 20)
+```
+
+Principal Component Analysis 
+
+Percentage of explained variance of PCs
+
+```{r}
+# Extract the eigenvalues/variances of the principal dimensions
+eigenvalue <- get_eig(prcomp(t(assay(dds_vst_pbmc))))
+eigenvalue$dim <- as.numeric(c(1:nrow(eigenvalue)))
+
+ggplot(eigenvalue, aes(dim, variance.percent))+ 
+  geom_bar(stat = "identity")+
+  geom_line(aes(dim, variance.percent)) +
+  geom_point(aes(dim, variance.percent)) +
+  geom_line(aes(dim, cumulative.variance.percent), colour= "grey") + 
+  geom_point(aes(dim, cumulative.variance.percent), colour= "grey") + 
+  scale_x_continuous(breaks=c(1:nrow(eigenvalue)))+
+  xlab("Dimensions") +
+  ylab("% of explained variance") +
+  theme_bw() + 
+  theme(text = element_text(size = 18, colour = "black"))
+rm(eigenvalue)
+```
+
+
+Plot PCA 
+
+```{r}
+plotPCA2 <- function(pca_input = dds_vst,
+                    pca_sample_table = sample_table,
+                    ntop=500,
+                    xPC=1,
+                    yPC=2,
+                    color,
+                    anno_colour,
+                    shape="NULL",
+                    point_size=3,
+                    title="PCA",
+                    label = NULL,
+                    label_subset = NULL){
+  
+  if(!is.data.frame(pca_input)){
+    vst_matrix <-as.matrix(assay(pca_input))
+  }else{
+    vst_matrix <- pca_input
+  }
+  
+  if(ntop=="all"){
+    pca <- prcomp(t(vst_matrix))
+  }else{
+    # select the ntop genes by variance
+    select <- order(rowVars(vst_matrix), decreasing=TRUE)[c(1:ntop)]
+    pca <- prcomp(t(vst_matrix[select,]))
+  }
+  
+  #calculate explained variance per PC
+  explVar <- pca$sdev^2/sum(pca$sdev^2)
+  # transform variance to percent
+  percentVar <- round(100 * explVar[c(xPC,yPC)], digits=1)
+  
+  # Define data for plotting
+  pcaData <- data.frame(xPC=pca$x[,xPC],
+                        yPC=pca$x[,yPC],
+                        color = pca_sample_table[[color]],
+                        name= as.character(pca_sample_table$ID),
+                        stringsAsFactors = F)
+  
+  #plot PCA
+  if(is.factor(pcaData$color) || is.character(pcaData$color)|| is.integer(pcaData$color)){
+    if(shape == "NULL"){
+      pca_plot <- ggplot(pcaData, aes(x = xPC, y = yPC, colour=color)) +
+        geom_point(size =point_size)
+    }else{
+      pcaData$shape = pca_sample_table[[shape]]
+      pca_plot <- ggplot(pcaData, aes(x = xPC, y = yPC, colour=color, shape=shape)) +
+        geom_point(size =point_size) +
+        scale_shape_discrete(name=shape)
+    }
+    
+    if(anno_colour[1] == "NULL"){
+      pca_plot <- pca_plot + scale_color_discrete(name=color)
+    }else{
+      pca_plot <- pca_plot + scale_color_manual(values=anno_colour, name=color)
+    }
+    
+  }else if(is.numeric(pcaData$color)){
+    if(shape == "NULL"){
+      pca_plot <- ggplot(pcaData, aes(x = xPC, y = yPC, colour=color)) +
+        geom_point(size =point_size) +
+        scale_color_gradientn(colours = bluered(100),name=color)
+    }else{
+      pcaData$shape = pca_sample_table[[shape]]
+      pca_plot <- ggplot(pcaData, aes(x = xPC, y = yPC, colour=color, shape=shape)) +
+        geom_point(size =point_size) +
+        scale_color_gradientn(colours = bluered(100),name=color)+
+        scale_shape_discrete(name=shape)
+    }
+  }
+  
+  # adds a label to the plot. To label only specific points, put them in the arument label_subset
+  if (!is.null(label) == TRUE){
+    pcaData$label <- pca_sample_table[[label]]
+    if(!is.null(label_subset) == TRUE){
+      pcaData_labeled <- pcaData[pcaData$label %in% label_subset,]
+    } else {
+      pcaData_labeled <- pcaData
+    }
+    pca_plot <- pca_plot +
+      geom_text_repel(data = pcaData_labeled, aes(label = label), nudge_x = 2, nudge_y = 2, colour = "black")
+  }
+  
+  pca_plot <- pca_plot+
+    xlab(paste0("PC ",xPC, ": ", percentVar[1], "% variance")) +
+    ylab(paste0("PC ",yPC,": ", percentVar[2], "% variance")) +
+    coord_fixed()+
+    theme_classic()+
+    theme(aspect.ratio = 1)+
+    #ggtitle(title)+
+    #stat_ellipse()
+    ggforce::geom_mark_ellipse()+theme(legend.position = "none")+xlim(c(-30,30))
+  
+  pca_plot
+}
+```
+
+## Figure 1B
+
+```{r, fig.width=5, fig.height=5}
+p <- plotPCA2(pca_input = dds_vst_pbmc, 
+        pca_sample_table = sample_table[pbmc_samples,],
+        ntop="all", 
+        xPC=1, 
+        yPC=2,
+        color= "disease",
+        anno_colour = ann_colors$disease,
+        shape="NULL",
+        point_size=5,
+        label= "donor",
+        title="Principal Component Analysis (disease)")
+
+
+cairo_pdf("../../Figures/Plots/PBMC_bulk_PCA2.pdf", width = 5, height = 5)
+p
+dev.off()
+
+p
+```
+
+
+## 3.3. Differential expression analysis
+
+```{r}
+comparison_table<-data.frame(comparison = c("HIV"),
+                             control = c("ctrl"))
+
+```
+
+```{r}
+DEresults_pbmc <- DEAnalysis(input = dds_pbmc,
+                        condition = "condition",
+                        alpha=0.05 ,
+                        lfcThreshold= 0,
+                        sigFC = 1.5,
+                        multiple_testing="IHW",
+                        independentFiltering = TRUE,
+                        shrinkage = TRUE,
+                        shrinkType="normal")
+
+```
+
+Summary of DE genes
+
+We use a for loop to print the number of significantly up- and down-regulated genes over all comparisons.
+
+```{r}
+DEcounts <- NULL
+
+for(i in 1:nrow(comparison_table)){
+  tmp <- unlist(DEresults_pbmc[[1+i]]@Number_DE_genes)
+  DEcounts <- rbind(DEcounts, tmp)
+}
+
+rownames(DEcounts) <- names(DEresults_pbmc)[-1]
+
+#DEresults$HIV_vs_ctrl@DE_genes$up_regulated_Genes$SYMBOL
+DEcounts
+```
+
+## Figure S1B
+
+```{r, fig.width=4, fig.height=4}
+DEcounts_df <- melt(DEcounts)
+DEcounts_df$Var2 <- gsub(DEcounts_df$Var2, pattern = "_regulated_Genes", replacement = "")
+DEcounts_df$Var2 <- factor(DEcounts_df$Var2, levels = c("up", "down"))
+
+p <- ggplot(DEcounts_df, aes(x= Var2, y= value, fill = Var2))+
+  geom_bar(stat = "identity")+
+  geom_text(stat='identity', aes(label=value), vjust=5)+
+  scale_fill_manual(values = c("#C45252", "#1C71A0")) + 
+  theme_bw()
+
+pdf("../../Figures/Plots/PBMC_DEG_number.pdf", width = 4, height = 4)
+p
+dev.off()
+
+p
+```
+
+
+```{r}
+df <- DEresults_pbmc$HIV_vs_ctrl@results
+df[df$log2FoldChange > log(1.5,2) & df$padj < 0.05, ]
+df[df$log2FoldChange < c(-log(1.5,2)) & df$padj < 0.05, ]
+
+```
+
+## Figure 1C
+
+```{r, echo=TRUE, message=FALSE, results='hide', fig.height=8, fig.width=7.5}
+# the uDEG() function produces the union of the DE genes from the specified comparisons
+allDEgenes <- uDEG(input = DEresults_pbmc, comparisons=c("HIV_vs_ctrl"))
+
+norm_df <- norm_anno_pbmc[,pbmc_samples]
+identical(sample_table[sample_table$seq_id == pbmc_samples, ]$seq_id, pbmc_samples)
+colnames(norm_df) <- sample_table[sample_table$seq_id == pbmc_samples, ]$donor
+
+set.seed(1000)
+data <- t(scale(t(norm_df[allDEgenes, c(  "CTRL01", "HIV01"  ,  "CTRL02" ,"HIV02"  ,  "CTRL03" ,"HIV03"   , "CTRL04", "HIV04" ,   "CTRL05" ,"HIV05" ) ])))
+
+
+column_ha=HeatmapAnnotation(df=sample_table[pbmc_samples,c("disease"), drop = F], 
+                              name = "annotation",
+                              col = list(disease=ann_colors$disease),
+                              gp = gpar(col = "black"))
+
+cluster_ha = rowAnnotation(row_anno = anno_empty(border = FALSE,
+                                      width = max_text_width(14) + unit(4, "mm")))
+
+
+data <- as.data.frame(data)
+data <- na.omit(data)
+
+tmp <- data.frame(GENEID = row.names(data), SYMBOL = gene_annotation[gene_annotation$GENEID %in% row.names(data), "SYMBOL"])
+tmp$GENEID_SYMBOL <- paste(tmp$GENEID, tmp$SYMBOL, sep = ":")
+row.names(data) <- tmp$GENEID_SYMBOL
+
+
+
+set.seed(1000)
+hm <- Heatmap(data, 
+        name = "expression, z-scaled",
+        col =  scaleColors(data = data, maxvalue = 1)[["color"]],
+ #       col = colorRamp2(c(-2, 0, 3), c("#0000FF", "white", "#FF0000")), 
+        show_row_names = F,
+        show_column_names = T,
+        cluster_columns = T, 
+        cluster_rows = T, 
+        row_names_side = "left", 
+        column_title = "all differentially expressed genes",
+        width = unit(7, "cm"),
+        border = T, 
+        top_annotation = column_ha,
+        column_split = sample_table[pbmc_samples,c("disease"), drop = F],
+         right_annotation = cluster_ha,
+        km = 4) 
+
+gene_symbols_to_check <- c("GAPDH", "IFNG", "HIF1A", "CCR2", "CCL5",  "TLR3", "S100A9", "S100A8", "CCL4", "IFNLR1", 
+                           "AIM2", "STAT1", "IFIT2", "IFI16", "IFI27", "ISG15", "PYCARD", "CXCL10", "IFNGR1", "TLR4", "CASP1",
+                           "JAK3", "RELA", "CREBBP", "IKBKB", "TIGIT", "TNFSF10", "NLRP3")
+
+genes_to_highlight <- tmp[tmp$SYMBOL %in% gene_symbols_to_check, "GENEID_SYMBOL"]
+
+idx <- which(row.names(data) %in% genes_to_highlight)
+
+
+clusters <- row_order(hm)
+for(i in 1:length(clusters)){
+    clusters[[i]] <- rownames(data)[clusters[[i]]]
+}
+cluster_lengths <- as.list(as.character(lengths(clusters)))
+
+
+set.seed(1000)
+draw(hm)
+
+for(i in 1:4) {
+  decorate_annotation(annotation = "row_anno",
+                      slice = i, {
+                        grid.rect(x = 0, width = unit(2, "mm"), gp = gpar(fill = i, col ="black"), just = "left")
+                        grid.text(paste(cluster_lengths[[i]], collapse = "\n"), x = unit(4, "mm"), just = "left")
+                      })
+}
+
+
+
+pdf("../../Figures/Plots/PBMC_DE_Heatmap_Modules_new.pdf", width = 8, height = 7.5)
+set.seed(1000)
+
+draw(hm)
+
+for(i in 1:4) {
+  decorate_annotation(annotation = "row_anno",
+                      slice = i, {
+                        grid.rect(x = 0, width = unit(2, "mm"), gp = gpar(fill = i, col ="black"), just = "left")
+                        grid.text(paste(cluster_lengths[[i]], collapse = "\n"), x = unit(4, "mm"), just = "left")
+                      })
+}
+
+dev.off()
+
+
+ha = rowAnnotation(foo = anno_mark(at = idx, labels =  row.names(data)[idx], labels_gp = gpar(fontsize = 7.5)))
+set.seed(1000)
+
+hm <- Heatmap(data,
+        name = "expression, z-scaled",
+        col =  scaleColors(data = data, maxvalue = 1)[["color"]],
+        show_row_names = F,
+        show_column_names = T,
+        cluster_columns = T,
+        cluster_rows = T,
+        row_names_side = "left",
+        column_title = "all differentially expressed genes",
+        width = unit(7, "cm"),
+        border = T,
+        top_annotation = column_ha,
+        column_split = sample_table[pbmc_samples,c("disease"), drop = F],
+         right_annotation = ha,
+        km = 4)
+draw(hm)
+
+
+pdf("../../Figures/Plots/PBMC_DE_Heatmap_Modules_markedgenes_new.pdf", width = 8, height = 7.5)
+
+set.seed(1000)
+draw(hm)
+
+dev.off()
+
+
+```
+
+
+## Figure 1D
+
+Functional Enrichment
+
+```{r}
+
+gmtfile_hallmarks <- clusterProfiler::read.gmt("../Files/h.all.v7.0.entrez.gmt")
+
+OrgDb = org.Hs.eg.db
+org = "hsa"
+
+KEGG_list<-list()
+GO_list<-list()
+HALLMARK_list <- list()
+
+# defintion of present genes
+present_genes<-row.names(dds_pbmc)
+
+present_genes <- gene_annotation[gene_annotation$GENEID %in% present_genes, "SYMBOL"]
+
+present_genes_entrez <- bitr(present_genes,
+                             fromType = "SYMBOL",
+                             toType="ENTREZID",
+                             OrgDb=org.Hs.eg.db)$ENTREZID
+
+# calculation of enrichments
+for (i in 1:length(clusters)) {
+  print(i)
+  markers <- clusters[[i]]
+  
+  markers <- str_split(markers, pattern = ":", simplify = T)[,2]
+
+  markers_entrez <- bitr(markers,
+                         fromType = "SYMBOL",
+                         toType="ENTREZID",
+                         OrgDb=org.Hs.eg.db)$ENTREZID
+  
+  
+  # GO enrichment
+  GO <- as.data.frame(enrichGO(gene = markers_entrez,
+                               universe = present_genes_entrez,
+                               OrgDb = OrgDb,
+                               ont = "BP",
+                               pAdjustMethod = "bonferroni",
+                               pvalueCutoff  = 0.05,
+                               qvalueCutoff  = 0.05,
+                               readable      = T))
+  if(nrow(GO)>0){GO$cluster <- paste("cluster ",i, sep="")}
+  
+ 
+   # HALLMARK enrichment
+  HALLMARK <- as.data.frame(enricher(gene = markers_entrez,
+                            #       organism = org,
+                                   universe = present_genes_entrez,
+                                   TERM2GENE=gmtfile_hallmarks, 
+                                   pAdjustMethod = "bonferroni",
+                                   pvalueCutoff  = 0.05,
+                                   qvalueCutoff  = 0.05))
+  if(nrow(HALLMARK)>0){HALLMARK$cluster <- paste("cluster ",i, sep="")}
+  
+  GO_list[[paste(i)]]<-GO
+  HALLMARK_list[[paste(i)]]<-HALLMARK
+}
+
+
+# GO results
+GOresults_HIV <- do.call(rbind, GO_list)
+GOresults_HIV %>% group_by(cluster) %>% top_n(n= 15, wt = GeneRatio) -> t
+tmp <- GOresults_HIV[GOresults_HIV$Description %in% t$Description,]
+tmp$Description <- ifelse(nchar(tmp$Description)>80,
+                          paste(substr(tmp$Description, 1, 80),"[...]",sep=""),
+                          tmp$Description)
+tmp$Description <- factor(tmp$Description,levels=unique(tmp$Description))
+tmp$cluster <- factor(tmp$cluster, levels=unique(tmp$cluster))
+p_GO<- ggplot(tmp, aes(x = cluster, y = Description, color = p.adjust)) +
+                geom_point(aes(size = Count)) +
+                scale_colour_gradientn(colours=c('red',
+                                                 'orange',
+                                                 'darkblue',
+                                                 'darkblue'),
+                                       limits=c(0,1),
+                                       values   = c(0,0.05,0.2,0.5,1),
+                                       breaks   = c(0.05,0.2,1),
+                                       labels = format(c(0.05,0.2,1))) +
+                ylab(NULL) +
+                theme_bw() +
+                theme(text = element_text(size=12), 
+                      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+HIV_GO <- tmp
+
+
+# HALLMARK results
+HALLMARKresults_HIV <- do.call(rbind, HALLMARK_list)
+HALLMARKresults_HIV %>% group_by(cluster) %>% top_n(n= 8, wt = GeneRatio) -> t
+tmp <- HALLMARKresults_HIV[HALLMARKresults_HIV$Description %in% t$Description,]
+tmp$Description <- ifelse(nchar(tmp$Description)>80,
+                          paste(substr(tmp$Description, 1, 80),"[...]",sep=""),
+                          tmp$Description)
+tmp$Description <- factor(tmp$Description,levels=unique(tmp$Description))
+tmp$cluster <- factor(tmp$cluster, levels=unique(tmp$cluster))
+p_Hallmark <- ggplot(tmp, aes(x = cluster, y = Description, color = p.adjust)) +
+                      geom_point(aes(size = Count)) +
+                      scale_colour_gradientn(colours=c('red',
+                                                       'orange',
+                                                       'darkblue',
+                                                       'darkblue'),
+                                             limits=c(0,1),
+                                             values   = c(0,0.05,0.2,0.5,1),
+                                             breaks   = c(0.05,0.2,1),
+                                             labels = format(c(0.05,0.2,1))) +
+                      ylab(NULL) +
+                      theme_bw() +
+                      theme(text = element_text(size=12), 
+                            axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+for(i in 1:nrow(tmp)){
+    tmp$gene_symbol[i] <-
+  paste(bitr(geneID = unlist(str_split(string = tmp$geneID[i], pattern = "/")), fromType = "ENTREZID", toType = "SYMBOL", OrgDb = org.Hs.eg.db)$SYMBOL, collapse = "/")
+  }
+
+HIV_HALLMARK <- tmp
+```
+
+```{r, fig.width= 7.5, fig.height=6}
+p_GO
+p_Hallmark
+```
+
+
+TF prediction
+
+```{r, fig.height=8, fig.width=5}
+#BiocManager::install("RcisTarget",update = F)
+library(RcisTarget)
+
+#download.file("https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg19/refseq_r45/mc9nr/gene_based/hg19-tss-centered-10kb-7species.mc9nr.feather", destfile = "hg19-tss-centered-10kb-7species.mc9nr.feather")
+
+# this has to be loaded once
+motifRankings <- importRankings("../Files/hg19-tss-centered-10kb-7species.mc9nr.feather")
+data(motifAnnotations_hgnc)
+
+clusters_new <- list()
+for (i in 1:length(clusters)) {
+  names(clusters)[[i]] <- paste0("cluster_", i)
+  
+  clusters_new[[i]] <-  str_split(clusters[[i]], pattern = ":", simplify = T)[,2]
+  names(clusters_new)[[i]] <- paste0("cluster_", i)
+
+    }
+
+
+  motif_enrichment_tmp <- cisTarget(clusters_new, motifRankings,
+                               motifAnnot=motifAnnotations_hgnc)
+  
+  motif_enrichment_tmp <- motif_enrichment_tmp[!motif_enrichment_tmp$TF_highConf == "",]
+ 
+  top_TFs <- data.frame()
+  
+  for(i in unique(motif_enrichment_tmp$geneSet)){
+    
+    tmp <- motif_enrichment_tmp[motif_enrichment_tmp$geneSet == i,]
+    tmp <- head(tmp, 10)
+    
+    top_TFs <- rbind(top_TFs, tmp)
+  }
+  
+  top_TFs$name <- top_TFs$TF_highConf
+  top_TFs$name <- gsub('\\(.*?\\). ', '', top_TFs$name)
+  top_TFs$name <- paste0(top_TFs$name, "(", top_TFs$NES, ")")
+  top_TFs <- top_TFs[!duplicated(top_TFs$name),]
+  top_TFs$name <- factor(top_TFs$name, levels = top_TFs[order(top_TFs$NES, decreasing = F),]$name)
+  top_TFs <- top_TFs[order(top_TFs$NES, decreasing = F),]
+  top_TFs$name <- stringr::str_trunc(top_TFs$name, 30)
+  
+  top_TFs$cluster <- gsub("cluster_", replacement = "", x = top_TFs$geneSet)
+  
+  top_TFs$cluster <- factor(top_TFs$cluster, levels = 1:length(unique(top_TFs$cluster)))
+  
+p <- ggplot(top_TFs, aes(x=1,y= name, fill = NES)) +
+      geom_tile() + 
+      facet_wrap(cluster ~ ., scales = "free", ncol = 1, strip.position = "right") +
+    theme_classic() + 
+      #scale_fill_gradientn(colors = rev(RColorBrewer::brewer.pal(n =11, name = "RdYlBu")))+
+      scale_fill_gradient2(midpoint = 0, low = "lightblue", high = "indianred")+
+      theme(axis.text.x = element_blank(), 
+            text = element_text(size = 14, color = "black"),
+            axis.title.x = element_blank(),
+            axis.ticks.x = element_blank(),
+            plot.title = element_text(size = 24),
+            strip.text.y =  element_text(angle = 0))+
+      ylab("Predicted TFs")+
+      ggtitle("TF Pred")+scale_y_discrete(position = "right")
+
+p  
+```
+
+
+## Figure S1C
+
+```{r}
+library(GSVA)
+### GSVA
+GSVA_my_signatures <- function(input = norm_anno,
+                               sample_table = sample_table,
+                               my_signatures=list("one"=c("IL1B","GAPDH"),"two"=c("TLR4","IL7R")),
+                               col_number = 5,
+                               method = "gsva",
+                               kcdf = "Gaussian",
+                               statistics = TRUE, 
+                               comparisons = my_comparisons){
+  
+  ## Select reference gene set & create signature list
+  signature_list = my_signatures
+  # for (i in names(my_signatures)) {
+  #   tmp=norm_anno[norm_anno$SYMBOL%in%my_signatures[[i]],]$GENEID
+  #   signature_list[[i]]<-tmp
+  # }
+  
+  
+  ## Rename column names for GSVA analysis
+  
+  # Reorder sample table to match the order of the count matrix
+  count.matrix <- input[, colnames(input) %in% as.character(sample_table$ID)]
+  idx <- match(colnames(count.matrix), as.character(sample_table$ID))
+  sample_table_sorted <- sample_table[ idx,]
+  # Ensure order are correct
+  if (identical(colnames(count.matrix), as.character(sample_table_sorted$ID))){
+    # Rename columns
+    colnames(count.matrix) <- sample_table_sorted$disease
+    count.matrix <- as.matrix(count.matrix)
+    
+    
+    
+    ## Perform GSVA
+    result_GSVA <- gsva(expr = count.matrix, 
+                        gset.idx.list = signature_list, 
+                        method = method, 
+                        kcdf = kcdf, 
+                        verbose = T, 
+                        parallel.sz = 1)
+    result_GSVA_melted <- melt(result_GSVA)
+    result_GSVA_melted$Var2<-factor(result_GSVA_melted$Var2,levels = unique(sample_table$disease))
+    
+    ## Plot result
+    p <- ggplot(result_GSVA_melted, aes(x = Var2, y = value, fill = Var2, color = Var2)) +
+      geom_boxplot(alpha = 0.5, outlier.colour = "white", outlier.size = 0.1) + 
+      geom_jitter(width = 0.3, size = 2) +
+      scale_fill_manual(values = ann_colors$disease) + 
+      scale_color_manual(values = ann_colors$disease) + 
+      facet_wrap(~Var1, scales = "free", ncol = col_number) + 
+      theme_light() +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+            strip.text = element_text(color = "black"), 
+            axis.text.x=element_text(angle=90,  vjust=0.5, hjust = 1),
+            text = element_text(size = 12, color = "black"),
+            legend.position = "none") +
+      ylab("Enrichment score") + 
+      xlab("") +
+      stat_compare_means(comparisons = comparisons, method = "t.test", label = "p.signif", size = 3)+
+      scale_y_continuous(breaks = scales::pretty_breaks(n = 5))
+    
+    
+    output <- list()
+    output$result <- result_GSVA_melted
+    output$plots <- p
+    
+    return(output)
+  } else { 
+    print("Issue during ordering of sample table and column names of count matrix")}
+}
+
+```
+
+
+```{r, fig.width=6, fig.height=3}
+marker_list <- list()
+for (i in 1:length(clusters)) {
+  markers <- clusters[[i]]
+  markers <- str_split(markers, pattern = ":", simplify = T)[,1]
+  marker_list[[paste0("cluster_", i)]] <- markers
+}
+
+
+p <- GSVA_my_signatures(input = norm_anno_pbmc,
+                   sample_table = sample_table,
+                   col_number = length(names(marker_list)),
+                   my_signatures = marker_list,
+                   method = "gsva",
+                   kcdf = "Gaussian",
+                   statistics = TRUE,
+                   comparisons =  list(c("HIV"  ,  "ctrl")
+                                      
+                                      ))
+              
+
+
+cairo_pdf("../../Figures/Plots/GSVA_cluster_modules.pdf", width = 6, height = 3)
+p
+dev.off()
+  
+p
+```
+
+
+
+
+## Figure 1E
+
+
+```{r}
+IL1B_genes <- read.gmt("D:/Sciebo/Rainer AG Schultze/HIV/HIV Steffi/analysis/for_rainer/IL1B_pathway.gmt")
+IL1B_genes <- IL1B_genes$gene
+```
+
+
+```{r, fig.width=6, fig.height=4}
+my_genes <- c("PYCARD", "NLRP3", "CASP4", "CASP1", "MAP2K6", "IRAK3", "CHUK", "IRAK4", "MAP3K7", "IL1RAP", "PRKCI", "PIK3CA", "IL1B")
+
+my_genes_ID <- gene_annotation[gene_annotation$SYMBOL %in% my_genes, ]$GENEID
+
+df <- na.omit(norm_anno_pbmc[my_genes_ID,pbmc_samples] )
+
+df <- df[,c(1,3,5,7,9,2,4,6,8,10)]
+
+row.names(df) <- gene_annotation[gene_annotation$GENEID %in% row.names(df) , ]$SYMBOL
+
+cairo_pdf("../../Figures/Plots/PBMC_bulk_IL1B_genes_new.pdf", width = 6, height = 4)
+
+pheatmap(df,
+        scale = "row", 
+        show_rownames = T,
+        breaks = scaleColors(data = scale(t(norm_anno_pbmc[my_genes_ID,pbmc_samples])), maxvalue = 2)[["breaks"]],
+        color = scaleColors(data = scale(t(norm_anno_pbmc[my_genes_ID,pbmc_samples])), maxvalue = 2)[["color"]], 
+        fontsize_col = 14,
+        fontsize_row = 12,
+        cluster_cols = F, border_color = T,
+        annotation_col = sample_table[pbmc_samples,c("donor", "disease")], 
+        annotation_colors = ann_colors
+          )
+
+dev.off()
+
+pheatmap(df,
+        scale = "row", 
+        show_rownames = T,
+        breaks = scaleColors(data = scale(t(norm_anno_pbmc[my_genes_ID,pbmc_samples])), maxvalue = 2)[["breaks"]],
+        color = scaleColors(data = scale(t(norm_anno_pbmc[my_genes_ID,pbmc_samples])), maxvalue = 2)[["color"]], 
+        fontsize_col = 14,
+        fontsize_row = 12,
+        cluster_cols = F, border_color = T,
+        annotation_col = sample_table[pbmc_samples,c("donor", "disease")], 
+        annotation_colors = ann_colors
+          )
+```
+
+# GSVA for IL1 beta pathways
+
+```{r}
+GOBP_IL1_production <- read.gmt("../Files/GOBP_INTERLEUKIN_1_PRODUCTION.v2022.1.Hs.gmt")
+GOBP_IL1_production <- GOBP_IL1_production$gene
+
+GOBP_response_to_IL1 <- read.gmt("../Files/GOBP_RESPONSE_TO_INTERLEUKIN_1.v2022.1.Hs.gmt")
+GOBP_response_to_IL1 <- GOBP_response_to_IL1$gene
+
+PID_IL1_pathway <- read.gmt("../Files/PID_IL1_PATHWAY.v2022.1.Hs.gmt")
+PID_IL1_pathway <- PID_IL1_pathway$gene
+
+REACTOME_IL1_signaling <- read.gmt("../Files/REACTOME_INTERLEUKIN_1_FAMILY_SIGNALING.v2022.1.Hs.gmt")
+REACTOME_IL1_signaling <- REACTOME_IL1_signaling$gene
+```
+
+
+```{r}
+library(GSVA)
+### GSVA
+GSVA_my_signatures2 <- function(input = norm_anno,
+                               sample_table = sample_table,
+                               my_signatures=list("one"=c("IL1B","GAPDH"),"two"=c("TLR4","IL7R")),
+                               col_number = 5,
+                               method = "gsva",
+                               kcdf = "Gaussian",
+                               statistics = TRUE, 
+                               comparisons = my_comparisons){
+  
+  ## Select reference gene set & create signature list
+  signature_list = my_signatures
+  # for (i in names(my_signatures)) {
+  #   tmp=norm_anno[norm_anno$SYMBOL%in%my_signatures[[i]],]$GENEID
+  #   signature_list[[i]]<-tmp
+  # }
+  
+  
+  ## Rename column names for GSVA analysis
+  
+  # Reorder sample table to match the order of the count matrix
+  count.matrix <- input[, colnames(input) %in% as.character(sample_table$ID)]
+  idx <- match(colnames(count.matrix), as.character(sample_table$ID))
+  sample_table_sorted <- sample_table[ idx,]
+  # Ensure order are correct
+  if (identical(colnames(count.matrix), as.character(sample_table_sorted$ID))){
+    # Rename columns
+    colnames(count.matrix) <- paste(sample_table_sorted$disease, sample_table_sorted$patient, sep = "_")
+    count.matrix <- as.matrix(count.matrix)
+    
+    
+    
+    ## Perform GSVA
+    result_GSVA <- gsva(expr = count.matrix, 
+                        gset.idx.list = signature_list, 
+                        method = method, 
+                        kcdf = kcdf, 
+                        verbose = T, 
+                        parallel.sz = 1)
+    
+    result_GSVA_melted <- melt(result_GSVA)
+    result_GSVA_melted$donor <- str_split(result_GSVA_melted$Var2, pattern = "_", simplify = T)[,2]
+    result_GSVA_melted$Var2 <- str_split(result_GSVA_melted$Var2, pattern = "_", simplify = T)[,1]
+    result_GSVA_melted$Var2<-factor(result_GSVA_melted$Var2,levels = unique(sample_table$disease))
+    
+    ## Plot result
+    p <- ggplot(result_GSVA_melted, aes(x = Var2, y = value, fill = Var2, color = Var2)) +
+      geom_boxplot(alpha = 0.5, outlier.colour = "white", outlier.size = 0.1) + 
+      geom_text_repel(aes(label = donor))+
+      geom_jitter(width = 0.3, size = 2) +
+      scale_fill_manual(values = ann_colors$disease) + 
+      scale_color_manual(values = ann_colors$disease) + 
+      facet_wrap(~Var1, scales = "free", ncol = col_number) + 
+      theme_light() +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+            panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+            strip.text = element_text(color = "black"), 
+            axis.text.x=element_text(angle=90,  vjust=0.5, hjust = 1),
+            text = element_text(size = 12, color = "black"),
+            legend.position = "none") +
+      ylab("Enrichment score") + 
+      xlab("") +
+      stat_compare_means(comparisons = comparisons, method = "t.test", label = "p.signif", size = 3)+
+      scale_y_continuous(breaks = scales::pretty_breaks(n = 5))
+    
+    
+    output <- list()
+    output$result <- result_GSVA_melted
+    output$plots <- p
+    
+    return(output)
+  } else { 
+    print("Issue during ordering of sample table and column names of count matrix")}
+}
+
+```
+
+
+```{r, fig.width=9, fig.height=3}
+IL1_signatures <- list()
+IL1_signatures[[paste0("GOBP_IL1_production n=", length(GOBP_IL1_production))]] <- gene_annotation[gene_annotation$SYMBOL %in% GOBP_IL1_production, "GENEID"]
+IL1_signatures[[paste0("GOBP_response_to_IL1 n=", length(GOBP_response_to_IL1))]] <- gene_annotation[gene_annotation$SYMBOL %in% GOBP_response_to_IL1, "GENEID"]
+IL1_signatures[[paste0("PID_IL1_pathway n=", length(PID_IL1_pathway))]] <- gene_annotation[gene_annotation$SYMBOL %in% PID_IL1_pathway, "GENEID"]
+IL1_signatures[[paste0("REACTOME_IL1_signaling n=", length(REACTOME_IL1_signaling))]] <- gene_annotation[gene_annotation$SYMBOL %in% REACTOME_IL1_signaling, "GENEID"]
+
+p <- GSVA_my_signatures2(input = norm_anno_pbmc,
+                   sample_table = sample_table,
+                   col_number = length(names(IL1_signatures)),
+                   my_signatures = IL1_signatures,
+                   method = "gsva",
+                   kcdf = "Gaussian",
+                   statistics = TRUE,
+                   comparisons =  list(c("HIV"  ,  "ctrl")
+                                      
+                                      ))
+              
+
+
+cairo_pdf("../../Figures/Plots/GSVA_cluster_modules.pdf", width = 6, height = 3)
+p
+dev.off()
+  
+p
+```
+
+
+# 4. CD14 Monocytes
+
+# 4.1. data loading
+
+```{r}
+cd14_samples <- as.character(sample_table[sample_table$sorting == "CD14",]$ID)
+```
+
+```{r}
+ddsHTSeq_cd14 <- DESeqDataSetFromMatrix(countData = cts[,cd14_samples],
+                                       colData  = sample_table[cd14_samples,],
+                                       design= ~ condition)
+
+ddsHTSeq_cd14
+```
+
+Pre-filtering
+
+```{r }
+genes_to_keep <- rowSums(counts(ddsHTSeq_cd14)) >= 10
+dds_cd14 <- ddsHTSeq_cd14[genes_to_keep,]
+```
+
+DESeq calculations
+
+```{r }
+dds_cd14 <- DESeq(dds_cd14)
+```
+
+Normalized count table  
+For inspection of the normalized data, we write the normalized counts into a data.frame called "norm_anno".
+
+```{r }
+norm_anno_cd14 <- as.data.frame(counts(dds_cd14, normalized=T))
+norm_anno_cd14$GENEID <- row.names(norm_anno_cd14)
+
+# add gene annotation extracted from the gtf file
+gene_annotation <- DESeqtools::tx_annotation_v27_human[!duplicated(DESeqtools::tx_annotation_v27_human$GENEID),c("GENEID", "SYMBOL", "GENETYPE")]
+gene_annotation <- gene_annotation[!is.na(gene_annotation$GENEID),]
+
+
+gene_annotation <- gene_annotation[match(rownames(norm_anno_cd14), gene_annotation$GENEID),]
+
+# check if row names of the normalized table and the gene annotation match perfectly
+all(rownames(norm_anno_cd14) == gene_annotation$GENEID)
+
+biomart <- biomart_human
+
+idx <- match(unlist(lapply(strsplit(gene_annotation$GENEID, split = "[.]"), `[[`, 1)), biomart$Gene.stable.ID)
+gene_annotation$DESCRIPTION <- biomart$Gene.description[idx]
+gene_annotation$CHR <- biomart$Chromosome.scaffold.name[idx]
+
+# merge expression table and annotation
+norm_anno_cd14 <- merge(norm_anno_cd14,
+                   gene_annotation,
+                   by = "GENEID")
+rownames(norm_anno_cd14) <- norm_anno_cd14$GENEID
+
+norm_anno_cd14[1:3,c(1:2, (ncol(norm_anno_cd14)-5):ncol(norm_anno_cd14))]
+```
+
+Variance stabilizing transformation
+
+```{r b}
+dds_vst_cd14 <- rlog(dds_cd14, blind = TRUE)
+```
+
+```{r}
+vst_anno_log2_cd14<-as.data.frame(assay(dds_vst_cd14))
+vst_anno_log2_cd14<-merge(vst_anno_log2_cd14,norm_anno[,c("GENEID","SYMBOL","GENETYPE","DESCRIPTION","CHR")],by="row.names")
+rownames(vst_anno_log2_cd14)<-vst_anno_log2_cd14$Row.names
+vst_anno_log2_cd14$Row.names<-NULL
+
+vst_anno_cd14<-as.data.frame(assay(dds_vst_cd14))
+vst_anno_cd14<-2^vst_anno_cd14
+vst_anno_cd14<-merge(vst_anno_cd14,norm_anno[,c("GENEID","SYMBOL","GENETYPE","DESCRIPTION","CHR")],by="row.names")
+rownames(vst_anno_cd14)<-vst_anno_cd14$Row.names
+vst_anno_cd14$Row.names<-NULL
+```
+
+
+Plot row standard deviations versus row means
+
+```{r echo=TRUE}
+meanSdPlot(as.matrix(assay(dds_vst_cd14)), ranks = FALSE)
+```
+
+
+# 4.2. Exploratory Data Analysis
+
+Frequencies of gene types
+
+```{r}
+TypeCounts <- as.data.frame(table(norm_anno_cd14$GENETYPE))
+colnames(TypeCounts) <- c("Type", "Frequency")
+TypeCounts <- subset(TypeCounts, Frequency>0)
+
+ggplot(TypeCounts, aes(x=Type, y= Frequency,  label=Frequency))+
+  geom_bar(stat="identity",fill="grey",colour="grey") +
+  theme_bw()+
+  geom_text(size = 3, position = position_stack(vjust = 1))+
+  guides(fill=FALSE)+
+  theme(text = element_text(size=10),axis.text.x = element_text(angle =90, hjust = 1))+
+  xlab("")
+```
+
+Histogram of of means per gene over all samples
+
+```{r}
+rMeans <- as.data.frame(log(rowMeans(counts(dds_cd14, normalized=TRUE)),10))
+colnames(rMeans) <- "rowMeans"
+ggplot(rMeans, aes(x = rowMeans)) + 
+  geom_histogram(bins=100) +
+  xlab("log10(rowMeans)")+
+  scale_x_continuous(breaks=c(0,1,2,3,4,5,6))+
+  theme_bw()
+```
+
+Boxplots of highest expressed genes
+
+```{r, fig.height=8, fig.width=8}
+highestGenes(data = norm_anno_cd14, numGenes = 20)
+```
+
+Principal Component Analysis 
+Percentage of explained variance of PCs
+
+```{r}
+# Extract the eigenvalues/variances of the principal dimensions
+eigenvalue <- get_eig(prcomp(t(assay(dds_vst_cd14))))
+eigenvalue$dim <- as.numeric(c(1:nrow(eigenvalue)))
+
+ggplot(eigenvalue, aes(dim, variance.percent))+ 
+  geom_bar(stat = "identity")+
+  geom_line(aes(dim, variance.percent)) +
+  geom_point(aes(dim, variance.percent)) +
+  geom_line(aes(dim, cumulative.variance.percent), colour= "grey") + 
+  geom_point(aes(dim, cumulative.variance.percent), colour= "grey") + 
+  scale_x_continuous(breaks=c(1:nrow(eigenvalue)))+
+  xlab("Dimensions") +
+  ylab("Percentage of explained variances") +
+  theme_bw()
+```
+
+Plot PCA 
+
+```{r, fig.width=6, fig.height=6}
+plotPCA(pca_input = dds_vst_cd14, 
+        pca_sample_table = sample_table[cd14_samples,],
+        ntop="all", 
+        xPC=1, 
+        yPC=2,
+        color= "disease",
+        anno_colour = ann_colors$disease,
+        shape="NULL",
+        point_size=5,
+        label= "donor",
+        title="Principal Component Analysis (disease)")
+```
+
+
+
+
+
+# 4.3. Differential expression analysis
+
+```{r}
+comparison_table<-data.frame(comparison = c("HIV"),
+                             control = c("ctrl"))
+```
+
+```{r}
+DEresults_cd14 <- DEAnalysis(input = dds_cd14,
+                        condition = "condition",
+                        alpha=0.05 ,
+                        lfcThreshold= 0,
+                        sigFC = 1.5,
+                        multiple_testing="IHW",
+                        independentFiltering = TRUE,
+                        shrinkage = TRUE,
+                        shrinkType="normal")
+```
+
+Summary of DE genes
+
+```{r}
+DEcounts <- NULL
+
+for(i in 1:nrow(comparison_table)){
+  tmp <- unlist(DEresults_cd14[[1+i]]@Number_DE_genes)
+  DEcounts <- rbind(DEcounts, tmp)
+}
+
+rownames(DEcounts) <- names(DEresults_cd14)[-1]
+
+DEcounts
+```
+
+## Figure S2B
+
+```{r, fig.width=4, fig.height=4}
+DEcounts_df <- melt(DEcounts)
+DEcounts_df$Var2 <- gsub(DEcounts_df$Var2, pattern = "_regulated_Genes", replacement = "")
+DEcounts_df$Var2 <- factor(DEcounts_df$Var2, levels = c("up", "down"))
+
+pdf("../../Figures/Plots/CD14_DEG_number.pdf", width = 4, height = 4)
+
+ggplot(DEcounts_df, aes(x= Var2, y= value, fill = Var2))+
+  geom_bar(stat = "identity")+
+  geom_text(stat='identity', aes(label=value), vjust=5)+
+  scale_fill_manual(values = c("#C45252", "#1C71A0")) + 
+  theme_bw()
+
+dev.off()
+```
+
+## Figure 2A
+Volcano Plot
+
+```{r, fig.width=5, fig.height=5}
+# specify labeling
+upDE <-  as.data.frame(DEresults_cd14[[c("HIV_vs_ctrl")]]@results[DEresults_cd14[[c("HIV_vs_ctrl")]]@results$regulation =="up",])
+
+FClabel_up <- upDE[order(abs(upDE$log2FoldChange), decreasing = TRUE),]
+  
+if(nrow(FClabel_up)>20){
+    FClabel_up <- as.character(FClabel_up[c(1:20),"GENEID"])
+  } else {
+    FClabel_up <- as.character(FClabel_up$GENEID)}
+  plabel_up <- upDE[order(upDE$padj, decreasing = FALSE),]
+  if(nrow(plabel_up)>20){
+    plabel_up <- as.character(plabel_up[c(1:20),"GENEID"])
+  } else {
+    plabel_up <- as.character(plabel_up$GENEID)}
+  
+  
+  
+downDE <-  as.data.frame(DEresults_cd14[[c("HIV_vs_ctrl")]]@results[DEresults_cd14[[c("HIV_vs_ctrl")]]@results$regulation =="down",])
+
+FClabel_down <- downDE[order(abs(downDE$log2FoldChange), decreasing = TRUE),]
+
+if(nrow(FClabel_down)>20){
+    FClabel_down <- as.character(FClabel_down[c(1:20),"GENEID"])
+  } else {
+    FClabel_down <- as.character(FClabel_down$GENEID)}
+  plabel_down <- downDE[order(downDE$padj, decreasing = FALSE),]
+  if(nrow(plabel_down)>20){
+    plabel_down <- as.character(plabel_down[c(1:20),"GENEID"])
+  } else {
+    plabel_down <- as.character(plabel_down$GENEID)}
+  
+  
+label<- unique(c(FClabel_up, plabel_up, FClabel_down, plabel_down))
+  
+data <- DEresults_cd14[[c("HIV_vs_ctrl")]]@results
+data$label<- ifelse(data$GENEID %in% label == "TRUE",as.character(data$SYMBOL), "")
+data <- data[,colnames(data) %in% c("label", "log2FoldChange", "padj", "regulation")]
+  
+p <- ggplot(data=na.omit(data), aes(x=log2FoldChange, y=-log10(padj), colour=regulation)) +
+    geom_point(size=2) +
+    scale_color_manual(values=c("cornflowerblue","darkgrey", "firebrick"))+
+    scale_x_continuous() +
+    scale_y_continuous() +
+    xlab("log2(FoldChange)") +
+    ylab("-log10(padj)") +
+    geom_vline(xintercept = 0, colour="black")+
+    geom_hline(yintercept=-log(0.05,10),colour="red")+
+    geom_text_repel(data=na.omit(data[!data$label =="",]),aes(label=label), size=3, max.overlaps = 20)+
+    guides(colour=FALSE) +
+    ggtitle(paste("Volcano Plot of: ",c("HIV_vs_ctrl"),sep="")) +
+    theme_bw()+
+    coord_cartesian(ylim = c(0,5))
+
+
+cairo_pdf("../../Figures/Plots/CD14_Volcano_Plot_new.pdf", width = 5, height = 5)
+p
+dev.off()
+
+p
+```
+
+
+# Figure 2B
+
+```{r, fig.width=7, fig.height=3.5}
+tmp <- norm_anno_cd14[norm_anno_cd14$GENEID == "ENSG00000160791.13",]
+tmp <- gather(data = tmp, key = "ID", value = "normalized_expression", -SYMBOL, -GENETYPE, -GENEID, -CHR, -DESCRIPTION)
+tmp <- merge(tmp, sample_table, all.x = T, all.y = F)
+p_CCR5 <- ggplot(tmp, aes(x = disease, y = normalized_expression)) + 
+  geom_quasirandom() + 
+  geom_boxplot(aes(fill = disease), alpha = 0.5, outlier.shape = NA)+
+  ggpubr::stat_compare_means(label = "p.signif")+
+  scale_fill_manual(values = ann_colors$disease) + 
+  scale_colour_manual(values = ann_colors$sorting) +
+  facet_wrap(~sorting) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  guides(fill=guide_legend(ncol=2))+ggtitle("CCR5")
+
+tmp <- norm_anno_cd14[norm_anno_cd14$GENEID == "ENSG00000170581.13",]
+tmp <- gather(data = tmp, key = "ID", value = "normalized_expression", -SYMBOL, -GENETYPE, -GENEID, -CHR, -DESCRIPTION)
+tmp <- merge(tmp, sample_table, all.x = T, all.y = F)
+p_STAT2 <- ggplot(tmp, aes(x = disease, y = normalized_expression)) + 
+  geom_quasirandom() + 
+  geom_boxplot(aes(fill = disease), alpha = 0.5, outlier.shape = NA) + 
+  ggpubr::stat_compare_means(method = "t.test", label = "p.signif")+
+  scale_fill_manual(values = ann_colors$disease) + 
+  scale_colour_manual(values = ann_colors$sorting) +
+  facet_wrap(~sorting) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  guides(fill=guide_legend(ncol=2))+ggtitle("STAT2")+ylim(c(1900, 10000))
+
+tmp <- norm_anno_cd14[norm_anno_cd14$GENEID == "ENSG00000115415.18",]
+tmp <- gather(data = tmp, key = "ID", value = "normalized_expression", -SYMBOL, -GENETYPE, -GENEID, -CHR, -DESCRIPTION)
+tmp <- merge(tmp, sample_table, all.x = T, all.y = F)
+p_STAT1 <- ggplot(tmp, aes(x = disease, y = normalized_expression)) + 
+  geom_quasirandom() + 
+  geom_boxplot(aes(fill = disease), alpha = 0.5, outlier.shape = NA) + 
+  ggpubr::stat_compare_means(method = "t.test", label = "p.signif")+
+  scale_fill_manual(values = ann_colors$disease) + 
+  scale_colour_manual(values = ann_colors$sorting) +
+  facet_wrap(~sorting) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  guides(fill=guide_legend(ncol=2))+ggtitle("STAT1")+ylim(c(7000, 30000))
+
+tmp <- norm_anno_cd14[norm_anno_cd14$GENEID == "ENSG00000160712.12",]
+tmp <- gather(data = tmp, key = "ID", value = "normalized_expression", -SYMBOL, -GENETYPE, -GENEID, -CHR, -DESCRIPTION)
+tmp <- merge(tmp, sample_table, all.x = T, all.y = F)
+p_IL6 <- ggplot(tmp, aes(x = disease, y = normalized_expression)) + 
+  geom_quasirandom() + 
+  geom_boxplot(aes(fill = disease), alpha = 0.5, outlier.shape = NA) + 
+  ggpubr::stat_compare_means(label = "p.signif")+
+  scale_fill_manual(values = ann_colors$disease) + 
+  scale_colour_manual(values = ann_colors$sorting) +
+  facet_wrap(~sorting) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  guides(fill=guide_legend(ncol=2))+ggtitle("IL6R")+ylim(c(2500, 3500))
+
+tmp <- norm_anno_cd14[norm_anno_cd14$GENEID == "ENSG00000169245.5",]
+tmp <- gather(data = tmp, key = "ID", value = "normalized_expression", -SYMBOL, -GENETYPE, -GENEID, -CHR, -DESCRIPTION)
+tmp <- merge(tmp, sample_table, all.x = T, all.y = F)
+p_CXCL10 <- ggplot(tmp, aes(x = disease, y = normalized_expression)) + 
+  geom_quasirandom() + 
+  geom_boxplot(aes(fill = disease), alpha = 0.5, outlier.shape = NA) + 
+  ggpubr::stat_compare_means(label = "p.signif")+
+  scale_fill_manual(values = ann_colors$disease) + 
+  scale_colour_manual(values = ann_colors$sorting) +
+  facet_wrap(~sorting) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  guides(fill=guide_legend(ncol=2))+ggtitle("CXCL10")+ylim(c(50, 700))
+
+
+tmp <- norm_anno_cd14[norm_anno_cd14$GENEID == "ENSG00000183486.12",]
+tmp <- gather(data = tmp, key = "ID", value = "normalized_expression", -SYMBOL, -GENETYPE, -GENEID, -CHR, -DESCRIPTION)
+tmp <- merge(tmp, sample_table, all.x = T, all.y = F)
+p_MX2 <- ggplot(tmp, aes(x = disease, y = normalized_expression)) + 
+  geom_quasirandom() + 
+  geom_boxplot(aes(fill = disease), alpha = 0.5, outlier.shape = NA) + 
+  ggpubr::stat_compare_means(label = "p.signif")+
+  scale_fill_manual(values = ann_colors$disease) + 
+  scale_colour_manual(values = ann_colors$sorting) +
+  facet_wrap(~sorting) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  guides(fill=guide_legend(ncol=2))+ggtitle("MX2")+ylim(c(900, 5500))
+
+
+tmp <- norm_anno_cd14[norm_anno_cd14$GENEID == "ENSG00000132530.16",]
+tmp <- gather(data = tmp, key = "ID", value = "normalized_expression", -SYMBOL, -GENETYPE, -GENEID, -CHR, -DESCRIPTION)
+tmp <- merge(tmp, sample_table, all.x = T, all.y = F)
+p_XAF1 <- ggplot(tmp, aes(x = disease, y = normalized_expression)) + 
+  geom_quasirandom() + 
+  geom_boxplot(aes(fill = disease), alpha = 0.5, outlier.shape = NA) + 
+  ggpubr::stat_compare_means(label = "p.signif")+
+  scale_fill_manual(values = ann_colors$disease) + 
+  scale_colour_manual(values = ann_colors$sorting) +
+  facet_wrap(~sorting) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  guides(fill=guide_legend(ncol=2))+ggtitle("XAF1")+ylim(c(1500, 10500))
+
+
+
+library(patchwork)
+
+cairo_pdf("../../Figures/Plots/CD14_bulk_selected_genes.pdf", width = 7, height = 3.5)
+  p_CXCL10+theme(legend.position = "none")+xlab("")+
+  p_STAT2+theme(legend.position = "none")+xlab("")+ylab("")+
+  p_MX2+theme(legend.position = "none")+xlab("")+ylab("")+
+  p_XAF1+theme(legend.position = "none")+xlab("")+ylab("")+
+  plot_layout(ncol = 4)
+dev.off()
+
+  p_CXCL10+theme(legend.position = "none")+xlab("")+
+  p_STAT2+theme(legend.position = "none")+xlab("")+ylab("")+
+  p_MX2+theme(legend.position = "none")+xlab("")+ylab("")+
+  p_XAF1+theme(legend.position = "none")+xlab("")+ylab("")+
+  plot_layout(ncol = 4)
+```
+
+
+
+```{r}
+cd14_stats <- DEresults_cd14$HIV_vs_ctrl@results$log2FoldChange
+names(cd14_stats) <- DEresults_cd14$HIV_vs_ctrl@results$SYMBOL
+```
+
+```{r, fig.height = 4, fig.width=6}
+library(tidyverse)
+res <- DEresults_cd14$HIV_vs_ctrl@results
+res <- res[res$padj < 0.1, ]
+res <- na.omit(res)
+res2 <- res %>% 
+  dplyr::select(SYMBOL, stat) %>% 
+  na.omit() %>% 
+  dplyr::distinct() %>% 
+  dplyr::group_by(SYMBOL) %>% 
+  dplyr::summarize(stat=mean(stat))
+res2
+ranks <- deframe(res2)
+pathways.hallmark <- gmtPathways("../Files/h.all.v7.0.symbols.gmt")
+fgseaRes <- fgsea(pathways=pathways.hallmark, stats=ranks, nperm=1000)
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+
+fgseaResTidy$pathway <- gsub(fgseaResTidy$pathway, pattern = "HALLMARK_", replacement = "")
+fgseaResTidy <- fgseaResTidy[fgseaResTidy$pval < 0.05, ]
+p <- ggplot(fgseaResTidy, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=NES)) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red")+
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA") + 
+  theme_minimal() + 
+  theme(text = element_text(size = 12), 
+        axis.title = element_text(size = 14), 
+        title = element_text(size = 14))
+
+cairo_pdf("../../Figures/Plots/CD14_Bulk_Hallmark_GSEA_new.pdf", width = 6, height = 4)
+p
+dev.off()
+
+p
+```
+
+
+Hallmarks 
+
+```{r, fig.width=4, fig.height=2.5}
+infa <- read.delim("../Files/inf_a.txt", stringsAsFactors = F)[-c(1:2),]
+p1<-plotEnrichment(infa,
+               cd14_stats) + labs(title="INF-a response \nin ranked gene list HIV vs. control") + theme(aspect.ratio = 1/2)
+
+infy <- read.delim("../Files/inf_y.txt", stringsAsFactors = F)[-c(1:2),]
+p2<-plotEnrichment(infy,
+               cd14_stats) + labs(title="INF-g response \nin ranked gene list HIV vs. control") + theme(aspect.ratio = 1/2)
+
+
+tnf <- read.delim("../Files/tnf_a.txt", stringsAsFactors = F)[-c(1:2),]
+p3<-plotEnrichment(tnf,
+               cd14_stats) + labs(title="TNF signaling \nin ranked gene list HIV vs. control") + theme(aspect.ratio = 1/2)
+
+
+ifnlam <- read.delim("../Files/inflammatory_response.txt", stringsAsFactors = F)[-c(1:2),]
+p4<-plotEnrichment(ifnlam,
+               cd14_stats) + labs(title="Inflammatory Response \nin ranked gene list HIV vs. control") + theme(aspect.ratio = 1/2)
+
+```
+
+```{r, fig.width=6, fig.height=4.5}
+cairo_pdf("../../Figures/Plots/CD14_Bulk_Hallmark_GSEA.pdf", width = 6, height = 4.5)
+multiplot(list(p1, p2, p3, p4), cols = 2)
+dev.off()
+
+multiplot(list(p1, p2, p3, p4), cols = 2)
+
+``` 
+
+
+# Figure 3E
+
+```{r, fig.width=3.5, fig.height=2.5}
+tmp <- norm_anno_cd14[norm_anno_cd14$GENEID == "ENSG00000137959.15",]
+tmp <- gather(data = tmp, key = "ID", value = "normalized_expression", -SYMBOL, -GENETYPE, -GENEID, -CHR, -DESCRIPTION)
+tmp <- merge(tmp, sample_table, all.x = T, all.y = F)
+p_IFITM3 <- ggplot(tmp, aes(x = disease, y = normalized_expression)) + 
+  geom_quasirandom() + 
+  geom_boxplot(aes(fill = disease), alpha = 0.5, outlier.shape = NA)+
+  scale_fill_manual(values = ann_colors$disease) + 
+  scale_colour_manual(values = ann_colors$sorting) +
+  facet_wrap(~sorting) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  guides(fill=guide_legend(ncol=2))+ggtitle("IFITM3")+ylim(c(0, 25000))
+
+tmp <- norm_anno_cd14[norm_anno_cd14$GENEID == "ENSG00000132530.16",]
+tmp <- gather(data = tmp, key = "ID", value = "normalized_expression", -SYMBOL, -GENETYPE, -GENEID, -CHR, -DESCRIPTION)
+tmp <- merge(tmp, sample_table, all.x = T, all.y = F)
+p_XAF1 <- ggplot(tmp, aes(x = disease, y = normalized_expression)) + 
+  geom_quasirandom() + 
+  geom_boxplot(aes(fill = disease), alpha = 0.5, outlier.shape = NA) + 
+  scale_fill_manual(values = ann_colors$disease) + 
+  scale_colour_manual(values = ann_colors$sorting) +
+  facet_wrap(~sorting) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  guides(fill=guide_legend(ncol=2))+ggtitle("XAF1")
+
+
+tmp <- norm_anno_cd14[norm_anno_cd14$GENEID == "ENSG00000117228.9",]
+tmp <- gather(data = tmp, key = "ID", value = "normalized_expression", -SYMBOL, -GENETYPE, -GENEID, -CHR, -DESCRIPTION)
+tmp <- merge(tmp, sample_table, all.x = T, all.y = F)
+p_GBP1 <- ggplot(tmp, aes(x = disease, y = normalized_expression)) + 
+  geom_quasirandom() + 
+  geom_boxplot(aes(fill = disease), alpha = 0.5, outlier.shape = NA) + 
+  scale_fill_manual(values = ann_colors$disease) + 
+  scale_colour_manual(values = ann_colors$sorting) +
+  facet_wrap(~sorting) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+  guides(fill=guide_legend(ncol=2))+ggtitle("GBP1")
+
+
+library(patchwork)
+
+cairo_pdf("../../Figures/Plots/CD14_bulk_selected_genes_intersect_sc.pdf", width = 3.5, height = 2.5)
+  p_XAF1+theme(legend.position = "none")+xlab("")+
+  p_GBP1+theme(legend.position = "none")+xlab("")+ylab("")+
+  plot_layout(ncol = 2)
+dev.off()
+
+  p_XAF1+theme(legend.position = "none")+xlab("")+
+  p_GBP1+theme(legend.position = "none")+xlab("")+ylab("")+
+  plot_layout(ncol = 2)
+```
+
+
+
+# Figure S3C
+
+
+```{r}
+library(VennDiagram)
+
+sc_DEG_up <- read.csv("../Files/HIV_pilot_scRNAseq_up_reg_DEG.csv")
+sc_DEG_up <- sc_DEG_up$x
+
+tmp <- DEresults_cd14$HIV_vs_ctrl@results
+CD14_DEG_up <- tmp[tmp$regulation == "up", ]
+CD14_DEG_up <- CD14_DEG_up$SYMBOL
+
+venn.diagram(
+  x = list(sc_DEG_up, CD14_DEG_up),
+  category.names = c("scRNAseq" , "CD14 bulk"),
+  filename = '../../Figures/Plots/DEG_sc_bulk_CD14_venn_diagramm.svg', imagetype = "svg", height = 3,width = 3, resolution = 300,
+  output=TRUE
+)
+```
+
+
+# Figure 2C
+
+Functional Enrichment
+
+```{r}
+
+gmtfile_hallmarks <- clusterProfiler::read.gmt("../Files/h.all.v7.0.entrez.gmt")
+
+OrgDb = org.Hs.eg.db
+org = "hsa"
+
+KEGG_list<-list()
+GO_list<-list()
+HALLMARK_list <- list()
+
+# defintion of present genes
+present_genes<-row.names(dds_cd14)
+
+present_genes <- gene_annotation[gene_annotation$GENEID %in% present_genes, "SYMBOL"]
+
+present_genes_entrez <- bitr(present_genes,
+                             fromType = "SYMBOL",
+                             toType="ENTREZID",
+                             OrgDb=org.Hs.eg.db)$ENTREZID
+
+DEG_list_CD14 <- list(DEresults_cd14$HIV_vs_ctrl@DE_genes$up_regulated_Genes$SYMBOL, DEresults_cd14$HIV_vs_ctrl@DE_genes$down_regulated_Genes$SYMBOL)
+names(DEG_list_CD14) <- c("up_regulated", "down_regulated")
+# calculation of enrichments
+for (i in 1:length(DEG_list_CD14)) {
+  name <- names(DEG_list_CD14)[i]
+  
+  markers <- DEG_list_CD14[[i]]
+
+  markers_entrez <- bitr(markers,
+                         fromType = "SYMBOL",
+                         toType="ENTREZID",
+                         OrgDb=org.Hs.eg.db)$ENTREZID
+  
+  
+  # GO enrichment
+  GO <- as.data.frame(enrichGO(gene = markers_entrez,
+                               universe = present_genes_entrez,
+                               OrgDb = OrgDb,
+                               ont = "BP",
+                               pAdjustMethod = "bonferroni",
+                               pvalueCutoff  = 0.05,
+                               qvalueCutoff  = 0.05,
+                               readable      = T))
+  if(nrow(GO)>0){GO$cluster <- name}
+  
+ 
+   # HALLMARK enrichment
+  HALLMARK <- as.data.frame(enricher(gene = markers_entrez,
+                            #       organism = org,
+                                   universe = present_genes_entrez,
+                                   TERM2GENE=gmtfile_hallmarks, 
+                                   pAdjustMethod = "bonferroni",
+                                   pvalueCutoff  = 0.05,
+                                   qvalueCutoff  = 0.05))
+  if(nrow(HALLMARK)>0){HALLMARK$cluster <- name}
+  
+  GO_list[[paste(i)]]<-GO
+  HALLMARK_list[[paste(i)]]<-HALLMARK
+}
+
+
+# GO results
+GOresults_HIV <- do.call(rbind, GO_list)
+GOresults_HIV %>% group_by(cluster) %>% top_n(n= 15, wt = GeneRatio) -> t
+tmp <- GOresults_HIV[GOresults_HIV$Description %in% t$Description,]
+tmp$Description <- ifelse(nchar(tmp$Description)>80,
+                          paste(substr(tmp$Description, 1, 80),"[...]",sep=""),
+                          tmp$Description)
+tmp$Description <- factor(tmp$Description,levels=unique(tmp$Description))
+tmp$cluster <- factor(tmp$cluster, levels=unique(tmp$cluster))
+p_GO<- ggplot(tmp, aes(x = cluster, y = Description, color = p.adjust)) +
+                geom_point(aes(size = Count)) +
+                scale_colour_gradientn(colours=c('red',
+                                                 'orange',
+                                                 'darkblue',
+                                                 'darkblue'),
+                                       limits=c(0,1),
+                                       values   = c(0,0.05,0.2,0.5,1),
+                                       breaks   = c(0.05,0.2,1),
+                                       labels = format(c(0.05,0.2,1))) +
+                ylab(NULL) +
+                theme_bw() +
+                theme(text = element_text(size=12), 
+                      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+HIV_GO <- tmp
+
+
+# HALLMARK results
+HALLMARKresults_HIV <- do.call(rbind, HALLMARK_list)
+HALLMARKresults_HIV %>% group_by(cluster) %>% top_n(n= 8, wt = GeneRatio) -> t
+tmp <- HALLMARKresults_HIV[HALLMARKresults_HIV$Description %in% t$Description,]
+tmp$Description <- ifelse(nchar(tmp$Description)>80,
+                          paste(substr(tmp$Description, 1, 80),"[...]",sep=""),
+                          tmp$Description)
+tmp$Description <- factor(tmp$Description,levels=unique(tmp$Description))
+tmp$cluster <- factor(tmp$cluster, levels=unique(tmp$cluster))
+p_Hallmark <- ggplot(tmp, aes(x = cluster, y = Description, color = p.adjust)) +
+                      geom_point(aes(size = Count)) +
+                      scale_colour_gradientn(colours=c('red',
+                                                       'orange',
+                                                       'darkblue',
+                                                       'darkblue'),
+                                             limits=c(0,1),
+                                             values   = c(0,0.05,0.2,0.5,1),
+                                             breaks   = c(0.05,0.2,1),
+                                             labels = format(c(0.05,0.2,1))) +
+                      ylab(NULL) +
+                      theme_bw() +
+                      theme(text = element_text(size=12), 
+                            axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+for(i in 1:nrow(tmp)){
+    tmp$gene_symbol[i] <-
+  paste(bitr(geneID = unlist(str_split(string = tmp$geneID[i], pattern = "/")), fromType = "ENTREZID", toType = "SYMBOL", OrgDb = org.Hs.eg.db)$SYMBOL, collapse = "/")
+  }
+
+HIV_HALLMARK <- tmp
+```
+
+```{r, fig.width=5, fig.height=3.5}
+HIV_GO$gene_symbol <- HIV_GO$geneID
+
+HIV_functional <- rbind(HIV_GO, HIV_HALLMARK)
+
+HIV_functional <- HIV_functional[order(HIV_functional$Count, decreasing = T), ]
+
+HIV_functional$Description <- factor(HIV_functional$Description, levels = rev(HIV_functional$Description))
+
+p <- ggplot(HIV_functional[1:10,], aes(x = Count, y = Description)) +
+                      geom_point(aes(size = Count)) +
+                      ylab(NULL) +
+                      theme_bw() +
+                      theme(text = element_text(size=12))+
+                      ggtitle("CD14: HIV vs ctrl up DEG (padj<0.05)")
+
+
+cairo_pdf("../../Figures/Plots/CD14_Bulk_functional_enrichment_up.pdf", width = 5, height = 3.5)
+p
+dev.off()
+
+p
+```
+
+
+
+
+# Figure 2D
+
+```{r}
+up_DEG_PBMC <- DEresults_pbmc$HIV_vs_ctrl@DE_genes$up_regulated_Genes
+down_DEG_PBMC <- DEresults_pbmc$HIV_vs_ctrl@DE_genes$down_regulated_Genes
+
+up_DEG_CD14 <- DEresults_cd14$HIV_vs_ctrl@DE_genes$up_regulated_Genes
+down_DEG_CD14 <- DEresults_cd14$HIV_vs_ctrl@DE_genes$down_regulated_Genes
+
+
+intersect(up_DEG_PBMC$SYMBOL, up_DEG_CD14$SYMBOL)
+
+intersect(down_DEG_PBMC$SYMBOL, down_DEG_CD14$SYMBOL)
+
+```
+
+```{r, fig.width=4, fig.height=4}
+DEG_list <- list(up_PBMC =up_DEG_PBMC$SYMBOL,
+     down_PBMC = down_DEG_PBMC$SYMBOL,
+     up_CD14 = up_DEG_CD14$SYMBOL,
+     down_CD14 = down_DEG_CD14$SYMBOL)
+  
+m = make_comb_mat(DEG_list)
+p <- UpSet(m[comb_degree(m) == 2], set_order = c("up_PBMC", "up_CD14", "down_PBMC", "down_CD14"), pt_size = unit(4, "mm"), lwd =3,  top_annotation = upset_top_annotation(m[comb_degree(m) == 2], add_numbers = TRUE),
+      right_annotation = upset_right_annotation(m[comb_degree(m) == 2], add_numbers = TRUE))
+
+cairo_pdf("../../Figures/Plots/PBMC_CD14_Bulk_overlapping_DEG.pdf", width = 4, height = 4)
+p
+dev.off()
+
+p
+```
+
+
+```{r}
+names(clusters) <- c("module_1", "module_2", "module_3", "module_4")
+
+check_cluster <- function(genes = genes){
+check_df <- data.frame("gene" = "gene", "module" = "module")
+
+for(gene in genes){
+  for(i in 1:length(clusters)){
+
+  if(length(clusters[[i]][grep(clusters[[i]], pattern = gene)]) == 1){
+    check_df$gene <- gene
+    check_df$module <- i
+  }
+ else {
+    check_df$gene <- gene
+    check_df$module <- "no_module"
+ }
+  
+    if(gene == genes[1]) check_df_all <- check_df
+    check_df_all <- rbind(check_df_all, check_df)
+    
+    }
+  
+}
+check_df_all <- check_df_all[!check_df_all$module == "no_module", ]
+return(check_df_all)
+}
+
+
+genes <- extract_comb(m, "1010")
+overlap_up <- check_cluster(genes)
+
+genes <- extract_comb(m, "0101")
+check_cluster(genes)
+
+```
+
+```{r, fig.width=2, fig.height=2}
+tmp <- table(overlap_up$module)
+tmp <- as.data.frame(tmp)
+colnames(tmp) <- c("module", "Freq")
+tmp$percentage <- paste0(round(tmp$Freq/sum(tmp$Freq), 2)*100, "%")
+
+p <- ggplot(tmp, aes(x="", y = Freq, fill = module))+
+  geom_bar(stat = "identity",  width=1, color="white")+
+  coord_polar("y", start = 0)+
+  theme_void()+
+  scale_fill_brewer(palette="Set1")+
+  geom_text(aes(label = percentage))
+
+cairo_pdf("../../Figures/Plots/PBMC_CD14_Bulk_overlapping_DEG_up_pie_chart.pdf", width = 2, height = 2)
+p
+dev.off()
+
+p
+```
+
+# Figure S3F
+
+```{r}
+DEG_sc <- readRDS("../Files/20230120_DEG_resting_non_classical_mono_scRNAseq_HIV_pilot.RDS")
+
+DEG_mono_resting <- DEG_sc[DEG_sc$cell_type == "Resting_Monocytes", ]
+DEG_mono_non_c <- DEG_sc[DEG_sc$cell_type == "Non_Classical_Monocytes", ]
+
+up_DEG_mono_resting <- DEG_mono_resting[DEG_mono_resting$avg_log2FC > 0, "Gene"]
+down_DEG_mono_resting <- DEG_mono_resting[DEG_mono_resting$avg_log2FC < 0, "Gene"]
+
+up_DEG_mono_non_c <- DEG_mono_non_c[DEG_mono_non_c$avg_log2FC > 0, "Gene"]
+down_DEG_mono_non_c <- DEG_mono_non_c[DEG_mono_non_c$avg_log2FC < 0, "Gene"]
+```
+
+
+
+```{r}
+names(clusters) <- c("module_1", "module_2", "module_3", "module_4")
+
+check_cluster <- function(genes = genes){
+check_df <- data.frame("gene" = "gene", "module" = "module")
+
+for(gene in genes){
+  for(i in 1:length(clusters)){
+
+  if(length(clusters[[i]][grep(clusters[[i]], pattern = gene)]) == 1){
+    check_df$gene <- gene
+    check_df$module <- i
+  }
+ else {
+    check_df$gene <- gene
+    check_df$module <- "no_module"
+ }
+  
+    if(gene == genes[1]) check_df_all <- check_df
+    check_df_all <- rbind(check_df_all, check_df)
+    
+    }
+  
+}
+check_df_all <- check_df_all[!check_df_all$module == "no_module", ]
+return(check_df_all)
+}
+
+overlap_resting <- check_cluster(up_DEG_mono_resting)
+
+overlap_non_c <- check_cluster(up_DEG_mono_non_c)
+
+```
+
+```{r, fig.width=4, fig.height=2}
+tmp <- table(overlap_resting$module)
+tmp <- as.data.frame(tmp)
+colnames(tmp) <- c("module", "Freq")
+tmp$percentage <- paste0(round(tmp$Freq/sum(tmp$Freq), 2)*100, "%")
+
+p1 <- ggplot(tmp, aes(x="", y = Freq, fill = module))+
+  geom_bar(stat = "identity",  width=1, color="white")+
+  coord_polar("y", start = 0)+
+  theme_void()+
+  scale_fill_brewer(palette="Set1")+
+  geom_text(aes(label = percentage))+
+  ggtitle("resting")
+
+
+
+tmp <- table(overlap_non_c$module)
+tmp <- as.data.frame(tmp)
+colnames(tmp) <- c("module", "Freq")
+tmp$percentage <- paste0(round(tmp$Freq/sum(tmp$Freq), 2)*100, "%")
+
+p2 <- ggplot(tmp, aes(x="", y = Freq, fill = module))+
+  geom_bar(stat = "identity",  width=1, color="white")+
+  coord_polar("y", start = 0)+
+  theme_void()+
+  scale_fill_brewer(palette="Set1")+
+  geom_text(aes(label = percentage))+
+  ggtitle("non_classical")
+
+
+
+
+
+cairo_pdf("../../Figures/Plots/PBMC_scRNAseq_overlapping_DEG_up_pie_chart.pdf", width = 4, height = 2)
+p1+p2
+dev.off()
+
+p1+p2
+```
+
+
+
+#----
+
+# 6. CD4 T cells
+
+# 6.1. data loading
+
+```{r}
+CD4_samples <- as.character(sample_table[sample_table$sorting == "CD4",]$ID)
+```
+
+```{r}
+ddsHTSeq_CD4 <- DESeqDataSetFromMatrix(countData = cts[,CD4_samples],
+                                       colData  = sample_table[CD4_samples,],
+                                       design= ~ condition)
+
+ddsHTSeq_CD4
+```
+
+Pre-filtering
+
+```{r }
+genes_to_keep <- rowSums(counts(ddsHTSeq_CD4)) >= 10
+dds_CD4 <- ddsHTSeq_CD4[genes_to_keep,]
+```
+
+DESeq calculations
+
+```{r }
+dds_CD4 <- DESeq(dds_CD4)
+```
+
+Normalized count table  
+For inspection of the normalized data, we write the normalized counts into a data.frame called "norm_anno".
+
+```{r }
+norm_anno_CD4 <- as.data.frame(counts(dds_CD4, normalized=T))
+norm_anno_CD4$GENEID <- row.names(norm_anno_CD4)
+
+# add gene annotation extracted from the gtf file
+gene_annotation <- DESeqtools::tx_annotation_v27_human[!duplicated(DESeqtools::tx_annotation_v27_human$GENEID),c("GENEID", "SYMBOL", "GENETYPE")]
+gene_annotation <- gene_annotation[!is.na(gene_annotation$GENEID),]
+
+
+gene_annotation <- gene_annotation[match(rownames(norm_anno_CD4), gene_annotation$GENEID),]
+
+# check if row names of the normalized table and the gene annotation match perfectly
+all(rownames(norm_anno_CD4) == gene_annotation$GENEID)
+
+biomart <- biomart_human
+
+idx <- match(unlist(lapply(strsplit(gene_annotation$GENEID, split = "[.]"), `[[`, 1)), biomart$Gene.stable.ID)
+gene_annotation$DESCRIPTION <- biomart$Gene.description[idx]
+gene_annotation$CHR <- biomart$Chromosome.scaffold.name[idx]
+
+# merge expression table and annotation
+norm_anno_CD4 <- merge(norm_anno_CD4,
+                   gene_annotation,
+                   by = "GENEID")
+rownames(norm_anno_CD4) <- norm_anno_CD4$GENEID
+
+norm_anno_CD4[1:3,c(1:2, (ncol(norm_anno_CD4)-5):ncol(norm_anno_CD4))]
+```
+
+Variance stabilizing transformation
+
+```{r b}
+dds_vst_CD4 <- rlog(dds_CD4, blind = TRUE)
+```
+
+```{r}
+vst_anno_log2_CD4<-as.data.frame(assay(dds_vst_CD4))
+vst_anno_log2_CD4<-merge(vst_anno_log2_CD4,norm_anno[,c("GENEID","SYMBOL","GENETYPE","DESCRIPTION","CHR")],by="row.names")
+rownames(vst_anno_log2_CD4)<-vst_anno_log2_CD4$Row.names
+vst_anno_log2_CD4$Row.names<-NULL
+
+vst_anno_CD4<-as.data.frame(assay(dds_vst_CD4))
+vst_anno_CD4<-2^vst_anno_CD4
+vst_anno_CD4<-merge(vst_anno_CD4,norm_anno[,c("GENEID","SYMBOL","GENETYPE","DESCRIPTION","CHR")],by="row.names")
+rownames(vst_anno_CD4)<-vst_anno_CD4$Row.names
+vst_anno_CD4$Row.names<-NULL
+```
+
+
+Plot row standard deviations versus row means
+
+```{r echo=TRUE}
+meanSdPlot(as.matrix(assay(dds_vst_CD4)), ranks = FALSE)
+```
+
+
+# 6.2. Exploratory Data Analysis
+
+Frequencies of gene types
+
+```{r}
+TypeCounts <- as.data.frame(table(norm_anno_CD4$GENETYPE))
+colnames(TypeCounts) <- c("Type", "Frequency")
+TypeCounts <- subset(TypeCounts, Frequency>0)
+
+ggplot(TypeCounts, aes(x=Type, y= Frequency,  label=Frequency))+
+  geom_bar(stat="identity",fill="grey",colour="grey") +
+  theme_bw()+
+  geom_text(size = 3, position = position_stack(vjust = 1))+
+  guides(fill=FALSE)+
+  theme(text = element_text(size=10),axis.text.x = element_text(angle =90, hjust = 1))+
+  xlab("")
+```
+
+Histogram of of means per gene over all samples
+
+```{r}
+rMeans <- as.data.frame(log(rowMeans(counts(dds_CD4, normalized=TRUE)),10))
+colnames(rMeans) <- "rowMeans"
+ggplot(rMeans, aes(x = rowMeans)) + 
+  geom_histogram(bins=100) +
+  xlab("log10(rowMeans)")+
+  scale_x_continuous(breaks=c(0,1,2,3,4,5,6))+
+  theme_bw()
+```
+
+Boxplots of highest expressed genes
+
+```{r, fig.height=8, fig.width=8}
+highestGenes(data = norm_anno_CD4, numGenes = 20)
+```
+
+Principal Component Analysis 
+Percentage of explained variance of PCs
+
+```{r}
+# Extract the eigenvalues/variances of the principal dimensions
+eigenvalue <- get_eig(prcomp(t(assay(dds_vst_CD4))))
+eigenvalue$dim <- as.numeric(c(1:nrow(eigenvalue)))
+
+ggplot(eigenvalue, aes(dim, variance.percent))+ 
+  geom_bar(stat = "identity")+
+  geom_line(aes(dim, variance.percent)) +
+  geom_point(aes(dim, variance.percent)) +
+  geom_line(aes(dim, cumulative.variance.percent), colour= "grey") + 
+  geom_point(aes(dim, cumulative.variance.percent), colour= "grey") + 
+  scale_x_continuous(breaks=c(1:nrow(eigenvalue)))+
+  xlab("Dimensions") +
+  ylab("Percentage of explained variances") +
+  theme_bw()
+```
+
+Plot PCA 
+
+```{r, fig.width=6, fig.height=6}
+plotPCA(pca_input = dds_vst_CD4, 
+        pca_sample_table = sample_table[CD4_samples,],
+        ntop="all", 
+        xPC=1, 
+        yPC=2,
+        color= "disease",
+        anno_colour = ann_colors$disease,
+        shape="NULL",
+        point_size=5,
+        label= "donor",
+        title="Principal Component Analysis (disease)")
+```
+
+
+
+
+
+# 6.3. Differential expression analysis
+
+```{r}
+comparison_table<-data.frame(comparison = c("HIV"),
+                             control = c("ctrl"))
+```
+
+```{r}
+DEresults_CD4 <- DEAnalysis(input = dds_CD4,
+                        condition = "condition",
+                        alpha=0.05 ,
+                        lfcThreshold= 0,
+                        sigFC = 1.5,
+                        multiple_testing="IHW",
+                        independentFiltering = TRUE,
+                        shrinkage = TRUE,
+                        shrinkType="normal")
+```
+
+Summary of DE genes
+
+```{r}
+DEcounts <- NULL
+
+for(i in 1:nrow(comparison_table)){
+  tmp <- unlist(DEresults_CD4[[1+i]]@Number_DE_genes)
+  DEcounts <- rbind(DEcounts, tmp)
+}
+
+rownames(DEcounts) <- names(DEresults_CD4)[-1]
+
+DEcounts
+```
+
+
+
+```{r, fig.width=4, fig.height=4}
+DEcounts_df <- melt(DEcounts)
+DEcounts_df$Var2 <- gsub(DEcounts_df$Var2, pattern = "_regulated_Genes", replacement = "")
+DEcounts_df$Var2 <- factor(DEcounts_df$Var2, levels = c("up", "down"))
+
+pdf("../../Figures/Plots/CD4_DEG_number.pdf", width = 4, height = 4)
+
+ggplot(DEcounts_df, aes(x= Var2, y= value, fill = Var2))+
+  geom_bar(stat = "identity")+
+  geom_text(stat='identity', aes(label=value), vjust=5)+
+  scale_fill_manual(values = c("#C45252", "#1C71A0")) + 
+  theme_bw()
+
+dev.off()
+```
+
+
+Volcano Plot
+
+```{r, fig.width=5, fig.height=5}
+# specify labeling
+upDE <-  as.data.frame(DEresults_CD4[[c("HIV_vs_ctrl")]]@results[DEresults_CD4[[c("HIV_vs_ctrl")]]@results$regulation =="up",])
+
+FClabel_up <- upDE[order(abs(upDE$log2FoldChange), decreasing = TRUE),]
+  
+if(nrow(FClabel_up)>20){
+    FClabel_up <- as.character(FClabel_up[c(1:20),"GENEID"])
+  } else {
+    FClabel_up <- as.character(FClabel_up$GENEID)}
+  plabel_up <- upDE[order(upDE$padj, decreasing = FALSE),]
+  if(nrow(plabel_up)>20){
+    plabel_up <- as.character(plabel_up[c(1:20),"GENEID"])
+  } else {
+    plabel_up <- as.character(plabel_up$GENEID)}
+  
+  
+  
+downDE <-  as.data.frame(DEresults_CD4[[c("HIV_vs_ctrl")]]@results[DEresults_CD4[[c("HIV_vs_ctrl")]]@results$regulation =="down",])
+
+FClabel_down <- downDE[order(abs(downDE$log2FoldChange), decreasing = TRUE),]
+
+if(nrow(FClabel_down)>20){
+    FClabel_down <- as.character(FClabel_down[c(1:20),"GENEID"])
+  } else {
+    FClabel_down <- as.character(FClabel_down$GENEID)}
+  plabel_down <- downDE[order(downDE$padj, decreasing = FALSE),]
+  if(nrow(plabel_down)>20){
+    plabel_down <- as.character(plabel_down[c(1:20),"GENEID"])
+  } else {
+    plabel_down <- as.character(plabel_down$GENEID)}
+  
+  
+label<- unique(c(FClabel_up, plabel_up, FClabel_down, plabel_down))
+  
+data <- DEresults_CD4[[c("HIV_vs_ctrl")]]@results
+data$label<- ifelse(data$GENEID %in% label == "TRUE",as.character(data$SYMBOL), "")
+data <- data[,colnames(data) %in% c("label", "log2FoldChange", "padj", "regulation")]
+  
+p <- ggplot(data=na.omit(data), aes(x=log2FoldChange, y=-log10(padj), colour=regulation)) +
+    geom_point(size=2) +
+    scale_color_manual(values=c("cornflowerblue","darkgrey", "firebrick"))+
+    scale_x_continuous() +
+    scale_y_continuous() +
+    xlab("log2(FoldChange)") +
+    ylab("-log10(padj)") +
+    geom_vline(xintercept = 0, colour="black")+
+    geom_hline(yintercept=-log(0.05,10),colour="red")+
+    geom_text_repel(data=na.omit(data[!data$label =="",]),aes(label=label), size=3, max.overlaps = 20)+
+    guides(colour=FALSE) +
+    ggtitle(paste("Volcano Plot of: ",c("HIV_vs_ctrl"),sep="")) +
+    theme_bw()+
+    coord_cartesian(ylim = c(0,2))
+
+
+cairo_pdf("../../Figures/Plots/CD4_Volcano_Plot_new.pdf", width = 5, height = 5)
+p
+dev.off()
+
+p
+```

@@ -1,0 +1,3288 @@
+---
+title: "Analysis scRNA seq HIV Pilot data"
+author: "Rainer Knoll"
+output: 
+  html_document: 
+    toc: true
+    toc_float: true
+    theme: united
+    number_sections: true
+    code_folding: hide
+---
+
+
+# 0. Functions and Packages
+
+reduction of blade RAM usage
+To make run the blades with 4 cores each approx 20 GB RAM.
+
+```{r, message=FALSE}
+
+library(devtools)
+remove.packages("future")
+remove.packages("future.apply")
+install_version("future", version = "1.12.0", repos = "http://cran.us.r-project.org", upgrade = "never")
+install_version("future.apply", version = "1.2.0", repos = "http://cran.us.r-project.org", upgrade = "never")
+library(future)
+library(future.apply)
+plan("multiprocess", workers = 4)
+options(future.globals.maxSize = 20000 * 1024^2)
+
+```
+
+
+packages
+
+```{r load packages, echo=FALSE, results='hide',message=FALSE,warning=FALSE}
+
+#only do this at the first time:
+#devtools::install_github("immunogenomics/harmony")
+# this might take long, though mostly because of the installation of Seurat.
+
+list.of.packages <- c("data.table","ggplot2","scales","useful","Seurat","readr","dplyr","RColorBrewer","Matrix", "ggrepel", "pheatmap", "reshape2", "readxl")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)>0) install.packages(new.packages,suppressUpdates=TRUE)
+list.of.bioc.packages<- c("genefilter","clusterProfiler","DOSE","org.Hs.eg.db")
+new.packages.bioc <- list.of.bioc.packages[!(list.of.bioc.packages %in% installed.packages()[,"Package"])]
+
+if(length(new.packages.bioc)>0) BiocManager::install(new.packages.bioc, update= FALSE)
+lapply(c(list.of.packages,list.of.bioc.packages), require, character.only = TRUE)
+
+library(harmony)
+library(tidyr)
+library(ComplexHeatmap)
+library(circlize)
+library(RcisTarget)
+library(gplots)
+library(qlcMatrix)
+library(data.table)
+library(GenomicRanges)
+library(data.table)
+library(rtracklayer)
+library(ggrastr)
+library(stringr)
+#library(nichenetr)
+library(tidyverse)
+library(gtools)
+library(ggpubr)
+library(stringi)
+library(tibble)
+library(RcisTarget)
+```
+
+reference datasets
+
+Upload the reference files for Gene annotation and GSEA.
+
+```{r}
+
+TF_cat <- read.delim("./signatures/TFcat.txt")
+Secretome <- read.delim("./signatures/human secretome.txt", header = F)
+colnames(Secretome) <- "Gene"
+Epigen_mod <- read.delim("./signatures/epigenetic_modulators.txt")
+Surface <- read.delim("./signatures/SurfaceomeHuman_Mouse.txt")
+
+## read the hallmark gmt file and immuno signature gmt
+gmtfile_hallmarks <- clusterProfiler::read.gmt("./signatures/h.all.v7.0.entrez.gmt")
+gmtfile_immunosignatures <- clusterProfiler::read.gmt("./signatures/c7.all.v7.0.entrez.gmt")
+
+```
+
+
+signatures
+
+```{r}
+P1 <- read_xlsx("./old stuff/Literature/Integrated Single-Cell Analysis of Multicellular Immune Dynamics during Hyper-Acute HIV-1 Infection/Table S3_Modules_and_genes.xlsx", sheet = 1)
+
+P1 <- P1[-c(1:2),] 
+P1 <- as.data.frame(t(P1))
+colnames(P1) <- t(P1[1,])
+P1 <- P1[-1,]
+
+P1_IFN_modules <- P1[,c("P1.Mono.M1", "P1.DC.M2", "P1.CD4.M1", "P1.CD4.M2", "P1.NK.M3", "P1.CTL.M5")]
+row.names(P1_IFN_modules) <- NULL
+
+
+P2 <- read_xlsx("./old stuff/Literature/Integrated Single-Cell Analysis of Multicellular Immune Dynamics during Hyper-Acute HIV-1 Infection/Table S3_Modules_and_genes.xlsx", sheet = 2)
+
+P2 <- P2[-c(1:2),] 
+P2 <- as.data.frame(t(P2))
+colnames(P2) <- t(P2[1,])
+P2 <- P2[-1,]
+
+P2_IFN_modules <- P2[,c("P2.Mono.M2", "P2.DC.M1", "P2.B.M3", "P2.CD4.M2", "P2.NK.M3", "P2.CTL.M4")]
+row.names(P2_IFN_modules) <- NULL
+
+
+P3 <- read_xlsx("./old stuff/Literature/Integrated Single-Cell Analysis of Multicellular Immune Dynamics during Hyper-Acute HIV-1 Infection/Table S3_Modules_and_genes.xlsx", sheet = 3)
+
+P3 <- P3[-c(1:2),] 
+P3 <- as.data.frame(t(P3))
+colnames(P3) <- t(P3[1,])
+P3 <- P3[-1,]
+
+P3_IFN_modules <- P3[,c("P3.Mono.M1", "P3.DC.M1", "P3.B.M3", "P3.CD4.M2", "P3.CD4.M2", "P3.NK.M2", "P3.CTL.M1")]
+row.names(P3_IFN_modules) <- NULL
+
+
+P4 <- read_xlsx("./old stuff/Literature/Integrated Single-Cell Analysis of Multicellular Immune Dynamics during Hyper-Acute HIV-1 Infection/Table S3_Modules_and_genes.xlsx", sheet = 4)
+
+P4 <- P4[-c(1),] 
+P4 <- as.data.frame(t(P4))
+colnames(P4) <- t(P4[1,])
+P4 <- P4[-1,]
+
+P4_IFN_modules <- P4[,c("P4.Mono.M2", "P4.DC.M1", "P4.B.M1", "P4.CD4.M2", "P4.NK.M2", "P4.CTL.M2")]
+row.names(P4_IFN_modules) <- NULL
+
+###
+
+
+Mono_IFN_list <- list()
+for(i in list(P1_IFN_modules, P2_IFN_modules, P3_IFN_modules, P4_IFN_modules)){
+  i <- as.data.frame(i)
+  column <-  grep(pattern = "Mono", x = colnames(i), value = T)
+  dat <- levels(i[,column])
+  Mono_IFN_list[[column]] <- grep(pattern = column, x = dat, invert =  TRUE, value= T)
+}
+Mono_IFN_list[["all"]] <- unique(unlist(Mono_IFN_list))
+
+
+DC_IFN_list <- list()
+for(i in list(P1_IFN_modules, P2_IFN_modules, P3_IFN_modules, P4_IFN_modules)){
+  i <- as.data.frame(i)
+  column <-  grep(pattern = "DC", x = colnames(i), value = T)
+  dat <- levels(i[,column])
+  DC_IFN_list[[column]] <- grep(pattern = column, x = dat, invert =  TRUE, value= T)
+}
+DC_IFN_list[["all"]] <- unique(unlist(DC_IFN_list))
+
+
+B_IFN_list <- list()
+for(i in list(P2_IFN_modules, P3_IFN_modules, P4_IFN_modules)){
+  i <- as.data.frame(i)
+  column <-  grep(pattern = "B\\.", x = colnames(i), value = T)
+  dat <- levels(i[,column])
+  B_IFN_list[[column]] <- grep(pattern = column, x = dat, invert =  TRUE, value= T)
+}
+B_IFN_list[["all"]] <- unique(unlist(B_IFN_list))
+
+
+CD4_IFN_list <- list()
+for(i in list(P1_IFN_modules, P2_IFN_modules, P3_IFN_modules, P4_IFN_modules)){
+  i <- as.data.frame(i)
+  column <-  grep(pattern = "CD4", x = colnames(i), value = T)
+  if(length(column) == 2){
+    column1 <- column[1]
+    column2 <- column[2]
+    
+  dat <- levels(i[,column1])
+  CD4_IFN_list[[column1]] <- grep(pattern = column1, x = dat, invert =  TRUE, value= T)
+  
+  dat <- levels(i[,column2])
+  CD4_IFN_list[[column2]] <- grep(pattern = column2, x = dat, invert =  TRUE, value= T)
+  } 
+  else{
+  dat <- levels(i[,column])
+  CD4_IFN_list[[column]] <- grep(pattern = column, x = dat, invert =  TRUE, value= T)
+  }
+}
+CD4_IFN_list[["all"]] <- unique(unlist(CD4_IFN_list))
+
+
+NK_IFN_list <- list()
+for(i in list(P1_IFN_modules, P2_IFN_modules, P3_IFN_modules, P4_IFN_modules)){
+  i <- as.data.frame(i)
+  column <-  grep(pattern = "NK", x = colnames(i), value = T)
+  dat <- levels(i[,column])
+  NK_IFN_list[[column]] <- grep(pattern = column, x = dat, invert =  TRUE, value= T)
+}
+NK_IFN_list[["all"]] <- unique(unlist(NK_IFN_list))
+
+
+CTL_IFN_list <- list()
+for(i in list(P1_IFN_modules, P2_IFN_modules, P3_IFN_modules, P4_IFN_modules)){
+  i <- as.data.frame(i)
+  column <-  grep(pattern = "CTL", x = colnames(i), value = T)
+  dat <- levels(i[,column])
+  CTL_IFN_list[[column]] <- grep(pattern = column, x = dat, invert =  TRUE, value= T)
+}
+CTL_IFN_list[["all"]] <- unique(unlist(CTL_IFN_list))
+
+```
+
+
+functions
+
+```{r}
+
+scaleColors <- function(data = input_scale, # data to use
+                        maxvalue = NULL # value at which the color is fully red / blue
+){
+  if(is.null(maxvalue)){
+    maxvalue <- floor(min(abs(min(data)), max(data)))
+  }
+  if(max(data) > abs(min(data))){
+    if(ceiling(max(data)) == maxvalue){
+      myBreaks <- c(floor(-max(data)), seq(-maxvalue+0.2, maxvalue-0.2, 0.2),  ceiling(max(data)))
+    } else{
+      myBreaks <- c(floor(-max(data)), seq(-maxvalue, maxvalue, 0.2),  ceiling(max(data)))
+    }
+    paletteLength <- length(myBreaks)
+    myColor <- colorRampPalette(c("blue", "white", "red"))(paletteLength)
+  } else {
+    if(-floor(min(data)) == maxvalue){
+      myBreaks <- c(floor(min(data)), seq(-maxvalue+0.2, maxvalue-0.2, 0.2),  ceiling(min(data)))
+    } else{
+      myBreaks <- c(floor(min(data)), seq(-maxvalue, maxvalue, 0.2),  ceiling(abs(min(data))))
+    }
+    paletteLength <- length(myBreaks)
+    myColor <- colorRampPalette(c("blue", "white", "red"))(paletteLength)
+  }
+  return(list(breaks = myBreaks, color = myColor))
+}
+
+
+
+
+
+# load some functions that may e useful
+multiplot<-function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+  
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+  
+  numPlots = length(plots)
+  
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                     ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+  
+  if (numPlots==1) {
+    print(plots[[1]])
+    
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+    
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+      
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+
+
+
+
+
+highestGenes <- function(input=expr,
+                         numGenes=50){
+  tmp <- input
+  tmp <- tmp[order(rowSums(tmp), decreasing = T),]
+  tmp <- tmp[1:numGenes,]
+  tmp <- melt(t(tmp))
+  colnames(tmp)<- c("sample","gene","value")
+  tmp$gene <- factor(tmp$gene, levels = rev(unique(tmp$gene)))
+
+  ggplot(tmp, aes(x = tmp$gene, y = value)) +
+      geom_boxplot()+
+      scale_y_continuous()+
+      xlab("Gene")+
+      ylab("Raw UMI Counts")+
+      ggtitle(paste("Counts of", numGenes, "highest expressed genes")) +
+      theme_bw() +
+      coord_flip() +
+      theme(axis.text.x = element_text(size=8, angle = 90, hjust = 1),
+            plot.title = element_text(size = 8, face = "bold"))
+}
+
+
+
+
+barcodeRanks_sh <- function (m, lower = 100, fit.bounds = NULL, df = 20, ...) 
+{
+    totals <- colSums(m)
+    o <- order(totals, decreasing = TRUE)
+    stuff <- rle(totals[o])
+    run.rank <- cumsum(stuff$lengths) - (stuff$lengths - 1)/2
+    run.totals <- stuff$values
+    keep <- run.totals > lower
+    if (sum(keep) < 3) {
+        print("insufficient unique points for computing knee/inflection points")
+      return(list(knee = 0, inflection = 0))
+    }
+    y <- log10(run.totals[keep])
+    x <- log10(run.rank[keep])
+    d1n <- diff(y)/diff(x)
+    right.edge <- which.min(d1n)
+    left.edge <- which.max(d1n[seq_len(right.edge)])
+    if (is.null(fit.bounds)) {
+        new.keep <- left.edge:right.edge
+    }
+    else {
+        new.keep <- y > log10(fit.bounds[1]) & y < log10(fit.bounds[2])
+    }
+    fit <- smooth.spline(x[new.keep], y[new.keep], df = df, ...)
+    d1 <- predict(fit, deriv = 1)$y
+    d2 <- predict(fit, deriv = 2)$y
+    curvature <- d2/(1 + d1^2)^1.5
+    knee <- 10^(y[which.min(curvature)])
+    inflection <- 10^(y[right.edge])
+    fitted.vals <- rep(NA_real_, length(keep))
+    fitted.vals[keep][new.keep] <- 10^fitted(fit)
+    return(list(knee = knee, inflection = inflection))
+}
+
+
+
+GOEA.of.list<- function(seurat_object,
+                        condition.list,
+                        GeneSets =c("GO","KEGG","Hallmark", "Reactome"),
+                        GOntology = "BP",
+                        pCorrection = "bonferroni",      # choose the p-value adjustment method
+                        pvalueCutoff = 0.1,      # set the unadj. or adj. p-value cutoff (depending on correction method)
+                        qvalueCutoff = 0.1       # set the q-value cutoff (FDR corrected)
+){
+  
+  OrgDb = org.Hs.eg.db
+  org = "hsa"
+  
+  
+  #present genes
+  present_genes<-rownames(seurat_object)
+  #present_genes <- as.matrix(GetAssayData(object = seurat_object, slot = 'counts'))
+  #present_genes <- rownames(present_genes[apply(present_genes, 1, function (x) {sum(x >= 1)})>0,])
+  present_genes_entrez <- bitr(present_genes, fromType = "SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)$ENTREZID
+  
+  # output lists
+  if("GO" %in% GeneSets){
+    GO_list<-list()
+  }
+  if("KEGG" %in% GeneSets){
+    KEGG_list<-list()
+  }
+  if("Hallmark" %in% GeneSets){
+    HALLMARK_list<-list()
+  }
+  if("Reactome" %in% GeneSets){
+    REACTOME_list<-list()
+  }
+  if("C_PATHWAYS" %in% GeneSets){
+    C_PATHWAYS_list<-list()
+  }
+  
+  
+  #go through different Gene lists
+  
+  for(i in names(condition.list)){
+    print(i)
+    #genes of interest
+    genes_oi<-condition.list[[i]]
+    entrez_genes_oi   <- bitr(genes_oi, fromType = "SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)$ENTREZID
+    
+    
+    # GO enrichment
+    if("GO" %in% GeneSets){
+      print("Performing GO enrichment")
+      GO <- as.data.frame(enrichGO(gene = entrez_genes_oi,
+                                   universe = present_genes_entrez,
+                                   OrgDb = OrgDb,
+                                   ont = GOntology,
+                                   pAdjustMethod = pCorrection,
+                                   pvalueCutoff  = pvalueCutoff,
+                                   qvalueCutoff  = qvalueCutoff,
+                                   readable      = T))
+      if(nrow(GO)>0){GO$Condition <- paste(i)}
+    }
+    
+    # KEGG enrichment
+    if("KEGG" %in% GeneSets){
+      print("Performing KEGG enrichment")
+      
+      org = "hsa"
+      
+      KEGG <- as.data.frame(enrichKEGG(gene = entrez_genes_oi,
+                                       organism = org,
+                                       universe = present_genes_entrez,
+                                       pAdjustMethod = pCorrection,
+                                       pvalueCutoff  = pvalueCutoff,
+                                       qvalueCutoff = qvalueCutoff))
+      if(nrow(KEGG)>0){KEGG$Condition <- paste(i)}
+    }
+    
+    
+    # Hallmark enrichment
+    if("Hallmark" %in% GeneSets){
+      print("Performing Hallmark enrichment")
+      
+      HALLMARK <- as.data.frame(enricher(entrez_genes_oi,
+                                         TERM2GENE=gmtfile_hallmarks,
+                                         universe = present_genes_entrez,
+                                         pAdjustMethod = pCorrection,
+                                         pvalueCutoff  = pvalueCutoff,
+                                         qvalueCutoff = qvalueCutoff))
+      if(nrow(HALLMARK)>0){HALLMARK$Condition <- paste(i)}
+    }
+    
+    
+    # Reactome enrichment
+    if("Reactome" %in% GeneSets){
+      print("Performing Reactome signature enrichment")
+      
+      REACTOME <- as.data.frame(enricher(entrez_genes_oi,
+                                         TERM2GENE=reactome_genes,
+                                         universe = present_genes_entrez,
+                                         pAdjustMethod = pCorrection,
+                                         pvalueCutoff  = pvalueCutoff,
+                                         qvalueCutoff = qvalueCutoff))
+      if(nrow(REACTOME)>0){REACTOME$Condition <- paste(i)}
+    }
+    
+    # Canonical pathway enrichment
+    if("C_PATHWAYS" %in% GeneSets){
+      print("Performing CANNONICAL PATHWAYS signature enrichment")
+      
+      C_PATHWAYS <- as.data.frame(enricher(entrez_genes_oi,
+                                           TERM2GENE=cannonicalPathway_genes_symbols,
+                                           universe = present_genes_entrez,
+                                           pAdjustMethod = pCorrection,
+                                           pvalueCutoff  = pvalueCutoff,
+                                           qvalueCutoff = qvalueCutoff))
+      if(nrow(C_PATHWAYS)>0){C_PATHWAYS$Condition <- paste(i)}
+    }   
+    
+    #concatenate output
+    if("GO" %in% GeneSets){
+      GO_list[[paste(i)]]<-GO
+    }
+    if("KEGG" %in% GeneSets){
+      KEGG_list[[paste(i)]]<-KEGG
+    }
+    if("Hallmark" %in% GeneSets){
+      HALLMARK_list[[paste(i)]]<-HALLMARK
+    }
+    if("Reactome" %in% GeneSets){
+      REACTOME_list[[paste(i)]]<-REACTOME
+    }
+    if("C_PATHWAYS" %in% GeneSets){
+      C_PATHWAYS_list[[paste(i)]]<-C_PATHWAYS
+    }
+    
+  }
+  #summarize results
+  results<-list()
+  
+  if("GO" %in% GeneSets){
+    results$GOresults <- do.call(rbind, GO_list)
+  }
+  if("KEGG" %in% GeneSets){
+    results$KEGGresults <- do.call(rbind, KEGG_list)
+  }
+  if("Hallmark" %in% GeneSets){
+    results$HALLMARKresults <- do.call(rbind, HALLMARK_list)
+  }
+  if("Reactome" %in% GeneSets){
+    results$REACTOMEresults <- do.call(rbind, REACTOME_list)
+  }
+  if("C_PATHWAYS" %in% GeneSets){
+    results$C_PATHWAYSresults <- do.call(rbind, C_PATHWAYS_list)
+  }
+  
+  
+  return(results)
+}
+
+dotplot.GOEA.list<-function(x,
+                            show =10,
+                            orderBy = "count", #padj or count
+                            colorBy = c("padj", "regulation") #padj or regulation
+){
+  if(nrow(x)<1){
+    print("No enrichment found.")
+  }else{
+    
+    
+    
+    #ORDERING
+    if(orderBy=="padj"){
+      x %>% group_by(Condition) %>% arrange(desc(Count), .by_group = TRUE) ->x
+      x %>% group_by(Condition) %>% arrange(desc(Count), .by_group = TRUE) %>% top_n(n= -show, wt = p.adjust) %>% pull(Description)->terms
+      x<-x[x$Description %in% terms,]
+      # x <- x[order(x$Count,decreasing=FALSE),]
+      # x <- x[order(x$p.adjust,decreasing=TRUE),]
+      x$Description <- ifelse(nchar(x$Description)>80,
+                              paste(substr(x$Description, 1, 80),"[...]",sep=""),
+                              x$Description)
+      x$Description <- factor(x$Description, levels = rev(unique(x$Description)))
+      #x$GeneRatio <- factor(x$GeneRatio, levels = unique(x$GeneRatio))
+      
+      if(colorBy=="regulation"){
+        #change color code of dots
+        x$DE.regulation<-"no"
+        if(nrow(x[grep("_up", x$Condition),])>0){
+          x[grep("_up", x$Condition),]$DE.regulation<-"up"
+        }
+        if(nrow(x[grep("_down", x$Condition),])>0){
+          x[grep("_down", x$Condition),]$DE.regulation<-"down"
+        }
+        
+        p<-ggplot(data = x ,aes(x=Condition, y=Description, size=Count , fill=DE.regulation)) +
+          geom_point(aes(fill=DE.regulation),pch=21)+theme_classic()+
+          theme_linedraw()+
+          theme(axis.text.y = element_text(color = "black"),
+                axis.text.x = element_text(angle=90, vjust=0.5,hjust=1, color = "black"),
+                text = element_text(size = 12))+
+          scale_fill_manual(values= c(up = "firebrick3", down = "dodgerblue2"))+
+          xlab("")+ylab("")+
+          #scale_size_area()
+          scale_radius()
+        plot(p)
+      }
+      
+      if(colorBy=="padj"){  
+        p<- ggplot(data = x, aes(x = Condition, y = Description, color = p.adjust)) +
+          geom_point(aes(size = Count)) +
+          scale_colour_gradientn(colours=c('red',
+                                           'orange',
+                                           'darkblue',
+                                           'darkblue'),
+                                 limits=c(0,1),
+                                 values   = c(0,0.05,0.2,0.5,1),
+                                 breaks   = c(0.05,0.2,1),
+                                 labels = format(c(0.05,0.2,1))) +
+          ylab(NULL) +
+          theme_bw() +
+          theme(text = element_text(size=12), 
+                axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+        plot(p)
+      }
+    }
+    
+    if(orderBy=="count"){
+      x %>% group_by(Condition) %>% arrange(p.adjust, .by_group = TRUE) ->x
+      x %>% group_by(Condition) %>% arrange(p.adjust, .by_group = TRUE) %>% top_n(n= show, wt = Count) %>% pull(Description) ->terms
+      x<-x[x$Description %in% terms,]
+      x$Description <- ifelse(nchar(x$Description)>80,
+                              paste(substr(x$Description, 1, 80),"[...]",sep=""),
+                              x$Description)
+      x$Description <- factor(x$Description, levels = rev(unique(x$Description)))
+      #x$GeneRatio <- factor(x$GeneRatio, levels = unique(x$GeneRatio))
+      
+      if(colorBy=="regulation"){
+        #change color code of dots
+        x$DE.regulation<-"no"
+        if(nrow(x[grep("_up", x$Condition),])>0){
+          x[grep("_up", x$Condition),]$DE.regulation<-"up"
+        }
+        if(nrow(x[grep("_down", x$Condition),])>0){
+          x[grep("_down", x$Condition),]$DE.regulation<-"down"
+        }
+        
+        p<-ggplot(data = x ,aes(x=Condition, y=Description, size=Count , fill=DE.regulation)) +
+          geom_point(aes(fill=DE.regulation),pch=21)+theme_classic()+
+          theme_linedraw()+
+          theme(axis.text.y = element_text(color = "black"),
+                axis.text.x = element_text(angle=90, vjust=0.5,hjust=1, color = "black"),
+                text = element_text(size = 12))+
+          scale_fill_manual(values= c(up = "firebrick3", down = "dodgerblue2"))+
+          xlab("")+ylab("")+
+          #scale_size_area()
+          scale_radius()
+        plot(p)
+      }
+      
+      if(colorBy=="padj"){  
+        p<- ggplot(data = x, aes(x = Condition, y = Description, color = p.adjust)) +
+          geom_point(aes(size = Count)) +
+          scale_colour_gradientn(colours=c('red',
+                                           'orange',
+                                           'darkblue',
+                                           'darkblue'),
+                                 limits=c(0,1),
+                                 values   = c(0,0.05,0.2,0.5,1),
+                                 breaks   = c(0.05,0.2,1),
+                                 labels = format(c(0.05,0.2,1))) +
+          ylab(NULL) +
+          theme_bw() +
+          theme(text = element_text(size=12), 
+                axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+        plot(p)
+      }
+    }
+    
+    
+  }
+}
+
+
+confusionMatrix <- function (i = NULL, j = NULL)
+{
+  ui <- unique(i)
+  uj <- unique(j)
+  m <- Matrix::sparseMatrix(i = match(i, ui), j = match(j,
+    uj), x = rep(1, length(i)), dims = c(length(ui), length(uj)))
+  rownames(m) <- ui
+  colnames(m) <- uj
+  m
+}
+
+```
+
+
+### Colors
+
+```{r}
+colors_patient<-c("NL01"="#eff3ff","NL02"="#feedde","NL03"="#bdd7e7",
+  "NL04"="#fdbe85","NL05"="#6baed6","NL06"="#fd8d3c",
+  "NL07"="#3182bd","NL08"="#e6550d","NL09"="#08519c","NL10"="#a63603")
+
+
+colors_celltype <- c("CD8 T cells" = "#3E80B7",
+                  "CD4 T cells" = '#DC332F',
+                  "NK cells" = '#1E405C',
+                  "Megakaryocytes" = '#E6C393',
+                  "B cells" = "#A24F23",
+                  "classical Monocytes" = "#806B87",
+                   "non-classical Monocytes" = "#D9890F",
+                  "Plasmablasts" = '#F0885E',
+                  "mDCs" = "#F9D44A",
+                  "pDCs" = "#B3DA4A",
+                  "Neutrophils" = "#648A82",
+              "Prol. cells" = '#6FD4E6',
+               "Eosinophils" = "#9C43B9",
+               "removal_eventually"= "4EA44C")
+
+colors_status <- c("HIV_pos" = "#F8766D",
+                  "control" = "#00BFC4")
+
+colors_IL1B <- c("not_available" = "lightblue", "High" = "indianred", "Low" = "orange")
+
+
+colors_mix <-c(brewer.pal(n = 9,name = "Set1"),
+                  brewer.pal(n = 8,name = "Set2"),
+                  brewer.pal(n = 12,name = "Set3"),
+                  brewer.pal(n = 12,name = "Paired"),
+                  brewer.pal(n = 9,name = "Pastel1"),
+                  brewer.pal(n = 8,name = "Pastel2"),
+                  brewer.pal(n = 8,name = "Accent"))
+
+
+
+colors_singleR <- c("T cells" = "#422483" ,   # "#776fb2"
+                    "T_cells" = "#776fb2",
+                    "CD4+ T-cells (naive)" = "#cecce2",
+                    "CD4+ T-cells" = "#cecce2",
+                    "CD4+ T cells" = "#cecce2",
+                    "T cells, CD4+" = "#cecce2",
+                    "CD4+/CD45RA+/CD25- Naive T" = "#cecce2",
+                    "CD4+ T Helper2" = "#cecce2",
+                    "CD4+ Tcm" = "#cecce2",
+                    "CD4+/CD45RO+ Memory" = "#cecce2",
+                    "CD4+ memory T-cells" = "#cecce2",
+                    "CD4+ Tem" = "#cecce2",
+                    
+                    "CD8+ T-cells (naive)" = "#422483",
+                    "CD8+/CD45RA+ Naive Cytotoxic" = "#422483",
+                    "CD8+ T-cells" = "#422483",
+                    "CD8+ T cells" = "#422483",
+                    "T cells, CD8+" = "#422483",
+                    "CD8+ Tcm" = "#422483",
+                    "CD8+ Cytotoxic T" = "#422483",
+                    "CD8+ Tem" = "#422483",
+                    
+                    "Treg cells" = "#004c9d",
+                    "CD4+/CD25 T Reg" = "#004c9d",
+                    "regulatory T-cells" = "#004c9d",
+                    
+                    "NKT cells" = "red",
+                    "NK T cells" = "red",
+                    "NK cells" = "#338eb0",
+                    "NK_cell" = "#338eb0",
+                    "CD56+ NK" = "#338eb0",
+                    
+                    "ILCs" = "#d9dada",
+                    
+                    "naive B-cells" = "#00963f",
+                    "B-cells" = "#00963f",
+                    "B_cell" = "#00963f",
+                    "B cells" = "#00963f",
+                    "CD19+ B" = "#00963f",
+                    "Pre-B_cell_CD34-" = "#00961a" ,
+                    "Pro-B_cell_CD34+" = "#00961a",
+                    "memory B-cells" = "#32ab6d",
+                    "class-switched memory B-cells" = "#7dc29e",
+                    "Plasma cells" = "#d5e7dd",
+                    
+                    "Progenitors" = "#b3a930", 
+                    "HSC" = "#b3a930",
+                    "HSCs" = "#b3a930",
+                    "HSC_-G-CSF" = "#b3a930",
+                    "HSC_CD34+" = "#b3a930",
+                    "CD34+ Precursors" = "#b3a930",
+                    "MPP" = "#dfd200",
+                    "CLP" = "#ffed00",
+                    "CMP" = "#fdef6d",
+                    "CMPs" = "#fdef6d",
+                    "GMP" = "#faf3a8",
+                    "GMPs" = "#faf3a8",
+                    "MEP" = "#e7bd00",
+                    "MEPs" = "#e7bd00",
+                    "Megakaryocytes" = "#efd873",
+                    
+                    "DC" = "#ef7c00",
+                    "Dendritic" = "#ef7c00",
+                    "Dendritic cells" = "#ef7c00",
+                    
+                    "Monocyte (CD16-)" = "#e6330f",
+                    "Monocyte (CD16+)" = "#ea5552",
+                    "Monocyte (CD14+)" = "#f4a5a5",
+                    "Monocytes" = "#f4a5a5",
+                    "Monocyte" = "#f4a5a5",
+                    "CD14+ Monocyte" = "#f4a5a5",
+                    
+                    "Granulocytes" = "#006358",
+                    "Eosinophils" = "#00af9d",
+                    "Neutrophils" = "#87cbbe",
+                    "Basophils" = "#cae6e4",
+                    "Macrophages" = "#b41909",
+                    
+                    "Erythrocytes" = "#bb79b2",
+                    "Erythroid cells" = "#bb79b2",
+                    "Platelets" = "#2a3937",
+                    
+                    "Adipocytes" = "#e2a9cd",
+                    "Fibroblasts" = "#be348b",
+                    "Endothelial cells" = "#7d2685",
+                    "mv Endothelial cells" = "#632282"
+                    )
+
+
+colors_anno <- list(Status = colors_status,
+                    Patient = colors_patient,
+                    IL1B = c("not_available" = "lightgreen",
+                             "High" = "orange", 
+                             "Low" = "lightblue"))
+
+colors_FG <- c("Classical Monocyte" = "#f4a5a5",
+               "B cell memory"     = "#32ab6d",
+               "Non-classical Monocyte" = "#ea5552",
+               "T cell CD4 naive"     = "#cecce2",
+               "B cell naive"       = "#00963f",
+               "NK cell"       = "#338eb0",
+               "T cell CD4 memory"   = "#cecce2",
+               "T cell regulatory"   = "#004c9d",
+               "Dendritic cell"      = "#ef7c00",
+               "T cell CD8 memory"     = "#422483",
+               "Mature Eosinophil"  = "#00af9d",
+               "Progenitor Leukocyte" = "#b3a930", 
+               "Macrophage"            = "#b41909",
+               "T cell CD8 naive"      = "#422483",
+               "Plasma cell"         = "#d5e7dd",
+               "Megakaryocyte"    = "#efd873",
+               "Other"           = "black",
+               "Unknown"   =      "grey",
+               "T cell gamma-delta" = "red",
+               "B cell progenitor" = "lila",
+               "T cell regulatory" = "darkorange")
+  
+  
+  
+```
+
+# -----------------------
+
+# I. Object creation
+
+# ------------------------
+
+# 1. Upload the aligned data
+
+We first need to set the working directory to the folder where we store our aligned and summarized tables for each sample. In a second step, we then simply upload the files containing 1) a summary of genic reads per cell, genes per cell & transcripts per cell and 2) the read table of genes of each single cell. Each single cell is represented by a cell barcode representing it.
+
+1) This file ends with "_dge.summary.txt" and contains the cell barcodes as rownames and three columns with NUM_GENIC_READS, NUM_TRANSCRIPTS and NUM_GENES.
+
+```{r}
+#set the working directory
+dir <- "~/data/"
+
+list_samples<-c("NL0111","NL0112","NL0113","NL0121","NL0122","NL0123","NL0211","NL0212","NL0221","NL0222","NL0223","NL0311","NL0312","NL0313","NL0321","NL0322","NL0411","NL0412","NL0413","NL0421","NL0422","NL0423","NL0511","NL0512","NL0521","NL0522","NL0523","NL0611","NL0612","NL0613","NL0621","NL0622","NL0711","NL0712","NL0713","NL0721","NL0722","NL0723","NL0811","NL0812","NL0813","NL0821","NL0822","NL0911","NL0912","NL0913","NL0921","NL0922","NL1011","NL1012","NL1013","NL1021","NL1022")
+
+list_dge<-list()
+
+for (i in list_samples){
+  sample<-fread(file.path(dir, "output/summary",paste(i,"_dge.summary.txt",sep="")), skip = 3, header=T)
+  sample %>% arrange(desc(NUM_GENIC_READS))  -> sample
+# Give indices to every cell to later sort them during plotting
+sample$index <- 1:nrow(sample)
+sample$condition<-paste(i)
+  list_dge[[paste(i)]]<-assign(paste(i),sample)
+  list_dge
+}
+
+rm("NL0111","NL0112","NL0113","NL0121","NL0122","NL0123","NL0211","NL0212","NL0221","NL0222","NL0223","NL0311","NL0312","NL0313","NL0321","NL0322","NL0411","NL0412","NL0413","NL0421","NL0422","NL0423","NL0511","NL0512","NL0521","NL0522","NL0523","NL0611","NL0612","NL0613","NL0621","NL0622","NL0711","NL0712","NL0713","NL0721","NL0722","NL0723","NL0811","NL0812","NL0813","NL0821","NL0822","NL0911","NL0912","NL0913","NL0921","NL0922","NL1011","NL1012","NL1013","NL1021","NL1022")
+
+stats_all<-bind_rows(list_dge)
+stats_first<-stats_all[stats_all$condition%in%unique(stats_all$condition)[1:10],]
+stats_sec<-stats_all[stats_all$condition%in%unique(stats_all$condition)[11:20],]
+stats_third<-stats_all[stats_all$condition%in%unique(stats_all$condition)[21:30],]
+stats_four<-stats_all[stats_all$condition%in%unique(stats_all$condition)[31:40],]
+stats_five<-stats_all[stats_all$condition%in%unique(stats_all$condition)[41:53],]
+
+```
+
+
+
+Genic reads per cell
+
+
+```{r}
+require(RColorBrewer)
+
+stats_first_filtered<-stats_first[stats_first$NUM_GENIC_READS>5000,]
+
+first_list<-list()
+for (i in stats_first_filtered$condition) {
+  phrase<-paste(i,":",length(which(stats_first_filtered$condition%in%i)), "cells",sep=" ")
+  first_list[[paste(i)]] <- phrase
+}
+first<-unlist(first_list, recursive = TRUE, use.names = F)
+
+
+ggplot(stats_first,aes(x=index,y=NUM_GENIC_READS,color=condition)) +
+  geom_line() +  scale_x_log10(labels = comma) + scale_y_log10(labels = comma)+
+  coord_cartesian(ylim = c(100,400000))+
+  ggtitle("Reads per cell distribution") + 
+  theme(axis.text.x=element_text(angle=90, size = 12),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(fill=NA, size=1))+
+  annotation_logticks()+
+
+# enter the threshold as y intercept
+  geom_hline(yintercept=5000, linetype="dashed", color = "red")+
+  annotation_logticks()  +
+  #scale_colour_manual(values = col_conditions)+
+  ylab(label="Genic reads")+
+  
+# change the names of the samples/condition in the ""
+  scale_color_discrete(labels=dput(first))
+
+stats_sec_filtered<-stats_sec[stats_sec$NUM_GENIC_READS>5000,]
+
+sec_list<-list()
+for (i in stats_sec_filtered$condition) {
+  phrase<-paste(i,":",length(which(stats_sec_filtered$condition%in%i)), "cells",sep=" ")
+  sec_list[[paste(i)]] <- phrase
+}
+sec<-unlist(sec_list, recursive = TRUE, use.names = F)
+
+
+ggplot(stats_sec,aes(x=index,y=NUM_GENIC_READS,color=condition)) +
+  geom_line() +  scale_x_log10(labels = comma) + scale_y_log10(labels = comma)+
+  coord_cartesian(ylim = c(100,400000))+
+  ggtitle("Reads per cell distribution") + 
+  theme(axis.text.x=element_text(angle=90, size = 12),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(fill=NA, size=1))+
+  annotation_logticks()+
+
+# enter the threshold as y intercept
+  geom_hline(yintercept=5000, linetype="dashed", color = "red")+
+  annotation_logticks()  +
+  #scale_colour_manual(values = col_conditions)+
+  ylab(label="Genic reads")+
+  
+# change the names of the samples/condition in the ""
+  scale_color_discrete(labels=dput(sec))
+
+stats_third_filtered<-stats_third[stats_third$NUM_GENIC_READS>5000,]
+
+third_list<-list()
+for (i in stats_third_filtered$condition) {
+  phrase<-paste(i,":",length(which(stats_third_filtered$condition%in%i)), "cells",sep=" ")
+  third_list[[paste(i)]] <- phrase
+}
+third<-unlist(third_list, recursive = TRUE, use.names = F)
+
+
+ggplot(stats_third,aes(x=index,y=NUM_GENIC_READS,color=condition)) +
+  geom_line() +  scale_x_log10(labels = comma) + scale_y_log10(labels = comma)+
+  coord_cartesian(ylim = c(100,400000))+
+  ggtitle("Reads per cell distribution") + 
+  theme(axis.text.x=element_text(angle=90, size = 12),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(fill=NA, size=1))+
+  annotation_logticks()+
+
+# enter the threshold as y intercept
+  geom_hline(yintercept=5000, linetype="dashed", color = "red")+
+  annotation_logticks()  +
+  #scale_colour_manual(values = col_conditions)+
+  ylab(label="Genic reads")+
+  
+# change the names of the samples/condition in the ""
+  scale_color_discrete(labels=dput(third))
+
+stats_four_filtered<-stats_four[stats_four$NUM_GENIC_READS>5000,]
+
+four_list<-list()
+for (i in stats_four_filtered$condition) {
+  phrase<-paste(i,":",length(which(stats_four_filtered$condition%in%i)), "cells",sep=" ")
+  four_list[[paste(i)]] <- phrase
+}
+four<-unlist(four_list, recursive = TRUE, use.names = F)
+
+
+ggplot(stats_four,aes(x=index,y=NUM_GENIC_READS,color=condition)) +
+  geom_line() +  scale_x_log10(labels = comma) + scale_y_log10(labels = comma)+
+  coord_cartesian(ylim = c(100,400000))+
+  ggtitle("Reads per cell distribution") + 
+  theme(axis.text.x=element_text(angle=90, size = 12),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(fill=NA, size=1))+
+  annotation_logticks()+
+
+# enter the threshold as y intercept
+  geom_hline(yintercept=5000, linetype="dashed", color = "red")+
+  annotation_logticks()  +
+  #scale_colour_manual(values = col_conditions)+
+  ylab(label="Genic reads")+
+  
+# change the names of the samples/condition in the ""
+  scale_color_discrete(labels=dput(four))
+
+stats_five_filtered<-stats_five[stats_five$NUM_GENIC_READS>5000,]
+
+five_list<-list()
+for (i in stats_five_filtered$condition) {
+  phrase<-paste(i,":",length(which(stats_five_filtered$condition%in%i)), "cells",sep=" ")
+  five_list[[paste(i)]] <- phrase
+}
+five<-unlist(five_list, recursive = TRUE, use.names = F)
+
+
+ggplot(stats_five,aes(x=index,y=NUM_GENIC_READS,color=condition)) +
+  geom_line() +  scale_x_log10(labels = comma) + scale_y_log10(labels = comma)+
+  coord_cartesian(ylim = c(100,400000))+
+  ggtitle("Reads per cell distribution") + 
+  theme(axis.text.x=element_text(angle=90, size = 12),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(fill=NA, size=1))+
+  annotation_logticks()+
+
+# enter the threshold as y intercept
+  geom_hline(yintercept=5000, linetype="dashed", color = "red")+
+  annotation_logticks()  +
+  #scale_colour_manual(values = col_conditions)+
+  ylab(label="Genic reads")+
+  
+# change the names of the samples/condition in the ""
+  scale_color_discrete(labels=dput(five))
+```
+
+Genes per cell
+
+```{r}
+
+list_samples<-c("NL0111","NL0112","NL0113","NL0121","NL0122","NL0123","NL0211","NL0212","NL0221","NL0222","NL0223","NL0311","NL0312","NL0313","NL0321","NL0322","NL0411","NL0412","NL0413","NL0421","NL0422","NL0423","NL0511","NL0512","NL0521","NL0522","NL0523","NL0611","NL0612","NL0613","NL0621","NL0622","NL0711","NL0712","NL0713","NL0721","NL0722","NL0723","NL0811","NL0812","NL0813","NL0821","NL0822","NL0911","NL0912","NL0913","NL0921","NL0922","NL1011","NL1012","NL1013","NL1021","NL1022")
+
+list_dge<-list()
+
+for (i in list_samples){
+  sample<-fread(file.path(dir, "output/summary",paste(i,"_dge.summary.txt",sep="")), skip = 3, header=T)
+  sample %>% arrange(desc(NUM_GENES))  -> sample
+# Give indices to every cell to later sort them during plotting
+sample$index <- 1:nrow(sample)
+sample$condition<-paste(i)
+  list_dge[[paste(i)]]<-assign(paste(i),sample)
+  list_dge
+}
+
+rm("NL0111","NL0112","NL0113","NL0121","NL0122","NL0123","NL0211","NL0212","NL0221","NL0222","NL0223","NL0311","NL0312","NL0313","NL0321","NL0322","NL0411","NL0412","NL0413","NL0421","NL0422","NL0423","NL0511","NL0512","NL0521","NL0522","NL0523","NL0611","NL0612","NL0613","NL0621","NL0622","NL0711","NL0712","NL0713","NL0721","NL0722","NL0723","NL0811","NL0812","NL0813","NL0821","NL0822","NL0911","NL0912","NL0913","NL0921","NL0922","NL1011","NL1012","NL1013","NL1021","NL1022")
+
+stats_all<-bind_rows(list_dge)
+stats_first<-stats_all[stats_all$condition%in%unique(stats_all$condition)[1:10],]
+stats_sec<-stats_all[stats_all$condition%in%unique(stats_all$condition)[11:20],]
+stats_third<-stats_all[stats_all$condition%in%unique(stats_all$condition)[21:30],]
+stats_four<-stats_all[stats_all$condition%in%unique(stats_all$condition)[31:40],]
+stats_five<-stats_all[stats_all$condition%in%unique(stats_all$condition)[41:53],]
+
+stats_first$run<-"first"
+
+
+
+require(RColorBrewer)
+
+stats_first_filtered<-stats_first[stats_first$NUM_GENES>200,]
+
+first_list<-list()
+for (i in stats_first_filtered$condition) {
+  phrase<-paste(i,":",length(which(stats_first_filtered$condition%in%i)), "cells",sep=" ")
+  first_list[[paste(i)]] <- phrase
+}
+first<-unlist(first_list, recursive = TRUE, use.names = F)
+
+
+ggplot(stats_first,aes(x=index,y=NUM_GENES,color=condition)) +
+  geom_line() +  scale_x_log10(labels = comma) + scale_y_log10(labels = comma)+
+  coord_cartesian(ylim = c(1,4000))+
+  ggtitle("Genes per cell distribution") + 
+  theme(axis.text.x=element_text(angle=90, size = 12),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(fill=NA, size=1))+
+  annotation_logticks()+
+
+# enter the threshold as y intercept
+  geom_hline(yintercept=200, linetype="dashed", color = "red")+
+  annotation_logticks()  +
+  #scale_colour_manual(values = col_conditions)+
+  ylab(label="Genes")+
+  
+# change the names of the samples/condition in the ""
+  scale_color_discrete(labels=dput(first))
+
+stats_sec_filtered<-stats_sec[stats_sec$NUM_GENES>200,]
+
+sec_list<-list()
+for (i in stats_sec_filtered$condition) {
+  phrase<-paste(i,":",length(which(stats_sec_filtered$condition%in%i)), "cells",sep=" ")
+  sec_list[[paste(i)]] <- phrase
+}
+sec<-unlist(sec_list, recursive = TRUE, use.names = F)
+
+
+ggplot(stats_sec,aes(x=index,y=NUM_GENES,color=condition)) +
+  geom_line() +  scale_x_log10(labels = comma) + scale_y_log10(labels = comma)+
+  coord_cartesian(ylim = c(1,4000))+
+  ggtitle("Genes per cell distribution") + 
+  theme(axis.text.x=element_text(angle=90, size = 12),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(fill=NA, size=1))+
+  annotation_logticks()+
+
+# enter the threshold as y intercept
+  geom_hline(yintercept=200, linetype="dashed", color = "red")+
+  annotation_logticks()  +
+  #scale_colour_manual(values = col_conditions)+
+  ylab(label="Genes")+
+  
+# change the names of the samples/condition in the ""
+  scale_color_discrete(labels=dput(sec))
+
+stats_third_filtered<-stats_third[stats_third$NUM_GENES>200,]
+
+third_list<-list()
+for (i in stats_third_filtered$condition) {
+  phrase<-paste(i,":",length(which(stats_third_filtered$condition%in%i)), "cells",sep=" ")
+  third_list[[paste(i)]] <- phrase
+}
+third<-unlist(third_list, recursive = TRUE, use.names = F)
+
+
+ggplot(stats_third,aes(x=index,y=NUM_GENES,color=condition)) +
+  geom_line() +  scale_x_log10(labels = comma) + scale_y_log10(labels = comma)+
+  coord_cartesian(ylim = c(1,4000))+
+  ggtitle("Genes per cell distribution") + 
+  theme(axis.text.x=element_text(angle=90, size = 12),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(fill=NA, size=1))+
+  annotation_logticks()+
+
+# enter the threshold as y intercept
+  geom_hline(yintercept=200, linetype="dashed", color = "red")+
+  annotation_logticks()  +
+  #scale_colour_manual(values = col_conditions)+
+  ylab(label="Genes")+
+  
+# change the names of the samples/condition in the ""
+  scale_color_discrete(labels=dput(third))
+
+stats_four_filtered<-stats_four[stats_four$NUM_GENES>200,]
+
+four_list<-list()
+for (i in stats_four_filtered$condition) {
+  phrase<-paste(i,":",length(which(stats_four_filtered$condition%in%i)), "cells",sep=" ")
+  four_list[[paste(i)]] <- phrase
+}
+four<-unlist(four_list, recursive = TRUE, use.names = F)
+
+
+ggplot(stats_four,aes(x=index,y=NUM_GENES,color=condition)) +
+  geom_line() +  scale_x_log10(labels = comma) + scale_y_log10(labels = comma)+
+  coord_cartesian(ylim = c(1,4000))+
+  ggtitle("Genes per cell distribution") + 
+  theme(axis.text.x=element_text(angle=90, size = 12),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(fill=NA, size=1))+
+  annotation_logticks()+
+
+# enter the threshold as y intercept
+  geom_hline(yintercept=200, linetype="dashed", color = "red")+
+  annotation_logticks()  +
+  #scale_colour_manual(values = col_conditions)+
+  ylab(label="Genes")+
+  
+# change the names of the samples/condition in the ""
+  scale_color_discrete(labels=dput(four))
+
+stats_five_filtered<-stats_five[stats_five$NUM_GENES>200,]
+
+five_list<-list()
+for (i in stats_five_filtered$condition) {
+  phrase<-paste(i,":",length(which(stats_five_filtered$condition%in%i)), "cells",sep=" ")
+  five_list[[paste(i)]] <- phrase
+}
+five<-unlist(five_list, recursive = TRUE, use.names = F)
+
+
+ggplot(stats_five,aes(x=index,y=NUM_GENES,color=condition)) +
+  geom_line() +  scale_x_log10(labels = comma) + scale_y_log10(labels = comma)+
+  coord_cartesian(ylim = c(1,4000))+
+  ggtitle("Genes per cell distribution") + 
+  theme(axis.text.x=element_text(angle=90, size = 12),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(fill=NA, size=1))+
+  annotation_logticks()+
+
+# enter the threshold as y intercept
+  geom_hline(yintercept=200, linetype="dashed", color = "red")+
+  annotation_logticks()  +
+  #scale_colour_manual(values = col_conditions)+
+  ylab(label="Genes")+
+  
+# change the names of the samples/condition in the ""
+  scale_color_discrete(labels=dput(five))
+```
+
+
+# 2. Create Seurat object in a for loop
+
+```{r}
+dir <- "~/data"
+
+list_samples<-c("NL0111","NL0112","NL0113","NL0121","NL0122","NL0123","NL0211","NL0212","NL0221","NL0222","NL0223","NL0311","NL0312","NL0313","NL0321","NL0322","NL0411","NL0412","NL0413","NL0421","NL0422","NL0423","NL0511","NL0512","NL0521","NL0522","NL0523","NL0611","NL0612","NL0613","NL0621","NL0622","NL0711","NL0712","NL0713","NL0721","NL0722","NL0723","NL0811","NL0812","NL0813","NL0821","NL0822","NL0911","NL0912","NL0913","NL0921","NL0922","NL1011","NL1012","NL1013","NL1021","NL1022")
+
+list_dge<-list()
+
+for (i in list_samples){
+  sample<-fread(file.path(dir, "output/summary",paste(i,"_dge.summary.txt",sep="")), skip = 3, header=T)
+  sample %>% arrange(desc(NUM_GENIC_READS))  -> sample
+# Give indices to every cell to later sort them during plotting
+sample$index <- 1:nrow(sample)
+sample <- sample[sample$NUM_GENIC_READS>5000,]
+sample$condition<-paste(i)
+  list_dge[[paste(i)]]<-assign(paste(i),sample)
+  list_dge
+}
+
+rm("NL0111","NL0112","NL0113","NL0121","NL0122","NL0123","NL0211","NL0212","NL0221","NL0222","NL0223","NL0311","NL0312","NL0313","NL0321","NL0322","NL0411","NL0412","NL0413","NL0421","NL0422","NL0423","NL0511","NL0512","NL0521","NL0522","NL0523","NL0611","NL0612","NL0613","NL0621","NL0622","NL0711","NL0712","NL0713","NL0721","NL0722","NL0723","NL0811","NL0812","NL0813","NL0821","NL0822","NL0911","NL0912","NL0913","NL0921","NL0922","NL1011","NL1012","NL1013","NL1021","NL1022")
+
+list_obj_names<-list()
+for (i in list_samples){
+  sample<-fread(file.path(dir, "output/summary",paste(i,"_umi_expression_matrix.tsv",sep="")),header=T)
+  sample <- as.data.frame(sample[,c("GENE", list_dge[[i]]$CELL_BARCODE),with=F])
+  sample[is.na(sample)] <- 0
+  row.names(sample) <- sample$GENE
+  sample$GENE <- NULL
+  sample  <- CreateSeuratObject(counts = sample,min.cells = 3,min.features = 200,project = i)
+  sample@meta.data$Sample_ID<-sample@meta.data$orig.ident
+  name<-paste("raw_data",i,sep="_")
+  assign(name,sample)
+  list_obj_names[[paste(i)]]<-name
+}
+
+list<-sub(x=list_samples,pattern = "NL",replacement = "raw_data_NL")
+list<-paste(list, collapse=",")
+
+Seurat  <- merge(x = raw_data_NL0111, y = c(raw_data_NL0112,raw_data_NL0113,raw_data_NL0121,raw_data_NL0122,raw_data_NL0123,raw_data_NL0211,raw_data_NL0212,raw_data_NL0221,raw_data_NL0222,raw_data_NL0223,raw_data_NL0311,raw_data_NL0312,raw_data_NL0313,raw_data_NL0321,raw_data_NL0322,raw_data_NL0411,raw_data_NL0412,raw_data_NL0413,raw_data_NL0421,raw_data_NL0422,raw_data_NL0423,raw_data_NL0511,raw_data_NL0512,raw_data_NL0521,raw_data_NL0522,raw_data_NL0523,raw_data_NL0611,raw_data_NL0612,raw_data_NL0613,raw_data_NL0621,raw_data_NL0622,raw_data_NL0711,raw_data_NL0712,raw_data_NL0713,raw_data_NL0721,raw_data_NL0722,raw_data_NL0723,raw_data_NL0811,raw_data_NL0812,raw_data_NL0813,raw_data_NL0821,raw_data_NL0822,raw_data_NL0911,raw_data_NL0912,raw_data_NL0913,raw_data_NL0921,raw_data_NL0922,raw_data_NL1011,raw_data_NL1012,raw_data_NL1013,raw_data_NL1021,raw_data_NL1022),add.cell.ids=list_samples)
+
+
+#Seurat<-Seurat_backup
+library(readxl)
+sample_description_HIV <- read_excel("~/data/Analysis/190605_sample_description_HIV.xlsx")
+
+
+colnames(Seurat@meta.data)
+meta.data<-merge(Seurat@meta.data,sample_description_HIV)
+meta.data_small<-Seurat@meta.data
+
+identical(meta.data$nCount_RNA,meta.data_small$nCount_RNA)
+Seurat@meta.data<-meta.data
+row.names(Seurat@meta.data)<-row.names(meta.data_small)
+head(Seurat@meta.data)
+```
+
+
+Save and load Seurat object w/o Filter
+
+```{r}
+# saveRDS(Seurat, file = "Seurat_Obj_no_filter.rds")
+# Seurat <- readRDS("./Seurat_Obj_no_filter.rds")
+# Seurat_nofilter <- Seurat
+
+```
+
+
+
+# 3. Quality control
+
+
+
+Violinplots genes and transcripts per cell
+
+As a next control we compare the amount of genes and transcripts per cell between the different replicates.
+
+```{r}
+VlnPlot(Seurat,features = "nCount_RNA",group.by = "Patient",log=T,pt.size = 0,cols = colors_patient)+
+  theme(axis.title.x = element_blank())+
+  ggtitle(label = "Patient")+
+  ylab(label = "Transcripts per cell")+
+  geom_boxplot(width=.2,alpha=0)+
+  NoLegend()
+```
+
+Number of cells per Donor
+
+```{r}
+ggplot(Seurat@meta.data, aes(x =Patient , fill=Patient))+
+  geom_bar(color="black")+
+  theme_bw()+
+  theme(
+    panel.grid=element_blank(),
+    legend.text=element_text(size=10),
+    text = element_text(size=14),
+    legend.title = element_blank(), axis.text.x = element_text(angle = 40, hjust = 1)
+  ) +
+  xlab("Patient")+
+  ylab("# of cells")+ scale_fill_manual(values=colors_patient)
+```
+
+
+Violin plot nGenes
+
+```{r}
+VlnPlot(Seurat,features = "nFeature_RNA",group.by = "Patient",log=T,pt.size = 0,cols = colors_patient)+
+  theme(axis.title.x = element_blank())+
+  ggtitle(label = "Patient")+
+  ylab(label = "nFeature per cell")+
+  geom_boxplot(width=.2,alpha=0)+
+  NoLegend()
+```
+
+highest expressed genes
+
+```{r}
+highestGenes(input = as.data.frame(Seurat@assays$RNA@counts), numGenes = 5)
+```
+
+
+
+mtRNA
+
+before removal of MT-RNR1/2
+
+The data shows a very high amount of mitochondrial genes. This is due to the MT-RNR1 and MT-RNR2 genes! 
+
+```{r}
+mito.genes <- grep(pattern = "^MT-", x = rownames(x = Seurat@assays$RNA), value = TRUE)
+percent.mito <- Matrix::colSums(Seurat@assays$RNA[mito.genes, ])/Matrix::colSums(Seurat@assays$RNA)
+
+Seurat <- AddMetaData(object = Seurat, metadata = percent.mito, col.name = "percent.mito")
+
+VlnPlot(Seurat,features = "percent.mito",group.by = "Patient", log=F,pt.size = 0,cols =  colors_patient)+
+  theme(axis.title.x = element_blank())+
+  ggtitle(label = "Patient")+
+  ylab(label = "mt genes per cell")+
+  geom_boxplot(width=.2,alpha=0)
+```
+
+removal of MT-RNR1/2
+
+```{r}
+Seurat@assays$RNA@data <- Seurat@assays$RNA@data[-which(row.names(Seurat@assays$RNA@data) %in% c("MT-RNR1", "MT-RNR2")),]
+
+
+mito.genes <- grep(pattern = "^MT-", x = rownames(x = Seurat@assays$RNA), value = TRUE)
+percent.mito <- Matrix::colSums(Seurat@assays$RNA[mito.genes, ])/Matrix::colSums(Seurat@assays$RNA)
+
+Seurat <- AddMetaData(object = Seurat, metadata = percent.mito, col.name = "percent.mito")
+
+VlnPlot(Seurat,features = "percent.mito",group.by = "Patient", log=F,pt.size = 0,cols =  colors_patient)+
+  theme(axis.title.x = element_blank())+
+  ggtitle(label = "Patient")+
+  ylab(label = "mt genes per cell")+
+  geom_boxplot(width=.2,alpha=0)
+```
+
+Ribosomal genes
+
+```{r}
+ribo.genes <- grep(pattern = "^RPL|^RPS|^MRP", x = rownames(x = Seurat@assays$RNA), value = TRUE)
+percent.ribo <- Matrix::colSums(Seurat@assays$RNA[ribo.genes, ])/Matrix::colSums(Seurat@assays$RNA)
+
+Seurat <- AddMetaData(object = Seurat, metadata = percent.ribo, col.name = "percent.ribo")
+
+VlnPlot(Seurat,features = "percent.ribo",group.by = "Patient",log=F,pt.size = 0,cols = colors_patient)+
+  theme(axis.title.x = element_blank())+
+  ggtitle(label = "ribosomal genes per cell distribution")+
+  ylab(label = "ribosomal genes per cell")+
+  geom_boxplot(width=.2,alpha=0)
+
+```
+
+HBB genes
+
+```{r}
+Hb.features <- grep(pattern = "^HBB|^HBA", x = rownames(x = Seurat), value = TRUE)
+percent.Hb <- Matrix::colSums(x=GetAssayData(object=Seurat,slot='counts')[Hb.features, ])/Matrix::colSums(x = GetAssayData(object=Seurat,slot='counts'))
+
+Seurat[['percent.Hb']] <- percent.Hb
+
+
+VlnPlot(Seurat,features = "percent.Hb",group.by = "Patient",log=F,pt.size = 0,cols = colors_patient)+
+  theme(axis.title.x = element_blank())+
+  ggtitle(label = "HBB genes per cell distribution")+
+  ylab(label = "Hbb genes per cell")+
+  geom_boxplot(width=.2,alpha=0)
+
+```
+
+
+Apply Filter
+
+```{r}
+#Seurat <- subset(Seurat, subset = nFeature_RNA > 200 & percent.mito < 0.05 & percent.Hb < 0.3)
+Seurat <- subset(Seurat, subset = nFeature_RNA > 200 & percent.mito < 0.1)
+```
+
+```{r}
+saveRDS(Seurat, file = paste0("Seurat_HIV_pilot_sc_filtered_", Sys.Date()))
+```
+
+
+# 4. Seurat steps
+
+Normalization
+
+```{r}
+Seurat <- NormalizeData(Seurat,
+                      normalization.method = "LogNormalize",
+                      scale.factor = 10000)
+Seurat <- FindVariableFeatures(Seurat, selection.method = "vst", nfeatures = 2000)
+#all.genes <- rownames(Seurat)
+Seurat <- ScaleData(Seurat, features = VariableFeatures(Seurat), vars.to.regress = "nCount_RNA")
+```
+
+PCA
+
+```{r}
+Seurat <- RunPCA(object = Seurat, verbose = FALSE)
+ElbowPlot(object = Seurat, ndims = 40)
+```
+
+Clustering
+
+```{r}
+Seurat <- FindNeighbors(object = Seurat, dims = 1:30)
+Seurat <- FindClusters(object = Seurat, resolution = 1)
+
+```
+
+UMAP
+
+```{r}
+Seurat <- RunUMAP(Seurat, dims = 1:30, verbose = FALSE)
+
+DimPlot(object = Seurat, reduction = "umap", group.by="Patient",cols = colors_patient)
+DimPlot(object = Seurat, reduction = "umap", group.by="Status",label = F)+scale_color_manual(values=colors_status)
+```
+
+```{r}
+DimPlot(object = Seurat, reduction = "umap", group.by="seurat_clusters",label = T, cols = colors_mix)
+```
+
+
+```{r, fig.width=5, fig.height=3.5}
+# control
+coord <- as.data.frame(Seurat@reductions$umap@cell.embeddings)
+annot <- data.frame(row.names = row.names(Seurat@meta.data), cluster = Seurat$Status, stringsAsFactors = F)
+annot$cluster <- as.character(annot$cluster)
+coord <- merge(coord, annot, by=0)
+
+# control
+gg_control <- ggplot(data=coord, aes(x = UMAP_1, y = UMAP_2), colour="grey", size=.1)+
+                      geom_point_rast(fill="grey",color="grey",size=.1,alpha=.5)+ 
+                      stat_density_2d(data = coord[coord$cluster %in% "control",],
+                                      aes(x = UMAP_1, y = UMAP_2,z=cluster,fill = ..level..), geom="polygon", contour=T, h= 0.5)+
+                      scale_fill_distiller(palette = "Blues",direction = 1)+
+                      theme(legend.position="none")+
+                      ggtitle(paste("control"))+
+                      theme_classic()
+
+
+# moderate
+gg_HIV <- ggplot(data=coord, aes(x = UMAP_1, y = UMAP_2), colour="grey", size=.1)+geom_point_rast(fill="grey",color="grey",size=.1,alpha=.5)+ 
+                      stat_density_2d(data = coord[coord$cluster %in% "HIV_pos",],
+                                      aes(x = UMAP_1, y = UMAP_2,z=cluster,fill = ..level..), geom="polygon", contour=T, h= 0.5)+
+                      scale_fill_distiller(palette = "Reds",direction = 1)+
+                      theme(legend.position="none")+
+                      ggtitle(paste("HIV"))+
+                      theme_classic()
+
+# 
+# cairo_pdf("scRNAseq_PBMC_control.pdf", width = 5, height = 3.5)
+# gg_control
+# dev.off()
+# 
+# cairo_pdf("scRNAseq_PBMC_HIV.pdf", width = 5, height = 3.5)
+# gg_HIV
+# dev.off()
+
+gg_control
+gg_HIV
+```
+
+
+
+# 5. Cleaning & Cell Annotation
+
+
+SingleR
+
+```{r}
+library(SingleR)
+input <- as.matrix(GetAssayData(object = Seurat, slot = "data", assay = "RNA"))
+
+# load reference data sets
+monaco.se <- MonacoImmuneData()
+immune.se <- DatabaseImmuneCellExpressionData()
+dmap.se <- NovershternHematopoieticData()
+hpca.se <- HumanPrimaryCellAtlasData()
+blueprint.se <- BlueprintEncodeData()
+
+
+singleR.list <- list()
+# perform singleR classification
+singleR.list$combined <- SingleR(test = input, 
+                                 method="single",
+                                 fine.tune=FALSE,
+                                 ref = list(blueprint=blueprint.se, 
+                                            hpca=hpca.se,
+                                            monaco= monaco.se,
+                                            immune=immune.se,
+                                            dmap= dmap.se), 
+                                 labels = list(blueprint.se$label.main, 
+                                               hpca.se$label.main,
+                                               monaco.se$label.main,
+                                               immune.se$label.main,
+                                               dmap.se$label.main
+                                 ))
+
+Seurat$combined.labels <- singleR.list$combined$labels
+
+singleR.list$Monaco <- SingleR(test = input, 
+                                 method="single",
+                                 fine.tune=FALSE,
+                                 ref = list(monaco= monaco.se), 
+                                 labels = list(monaco.se$label.main
+                                 ))
+
+Seurat$Monaco <- singleR.list$Monaco$labels
+
+
+DimPlot(object = Seurat, reduction = 'umap', label = FALSE, group.by ="combined.labels") + ggtitle("Combined labels")+scale_color_manual(values=colors_singleR)
+
+DimPlot(object = Seurat, reduction = 'umap', label = FALSE, group.by ="Monaco") + ggtitle("Monaco")+scale_color_manual(values=colors_singleR)
+
+
+```
+
+
+
+```{r, fig.height=20, fig.width=10}
+Idents(Seurat) <- "seurat_clusters"
+
+Cluster_markers <- FindAllMarkers(Seurat, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", max.cells.per.ident = 1000)
+
+top <- Cluster_markers %>% group_by(cluster) %>% top_n(n = 6, wt = avg_log2FC)
+
+DotPlot(Seurat, features = unique(top$gene), group.by = "seurat_clusters")+ scale_colour_gradient2(low = "#053061", mid = "white", high = "#67001F")+RotatedAxis()+coord_flip()
+
+```
+
+removal of cluster I
+
+removing cluster 16 since it contains HBB rich cells/contaminations
+
+```{r}
+Seurat_before_removal_clusters <- Seurat
+Seurat_sub <- Seurat
+
+Idents(Seurat_sub) <- "seurat_clusters"
+Seurat_sub <- subset(Seurat_sub, idents = 16, invert = T)
+
+Seurat_sub <- NormalizeData(Seurat_sub,
+                      normalization.method = "LogNormalize",
+                      scale.factor = 10000)
+Seurat_sub <- FindVariableFeatures(Seurat_sub, selection.method = "vst", nfeatures = 2000)
+Seurat_sub <- ScaleData(Seurat_sub, features = VariableFeatures(Seurat_sub), vars.to.regress = "nCount_RNA")
+Seurat_sub <- RunPCA(object = Seurat_sub, verbose = FALSE)
+Seurat_sub <- RunUMAP(object = Seurat_sub,dims=1:30)
+Seurat_sub <- FindNeighbors(Seurat_sub, reduction = "pca", dims = 1:30)
+Seurat_sub <- FindClusters(Seurat_sub, resolution = 1)
+
+DimPlot(Seurat_sub, reduction = "umap", label = T, group.by = "RNA_snn_res.1", cols = colors_mix)
+
+```
+
+
+```{r, fig.height=20, fig.width=10}
+Idents(Seurat_sub) <- "seurat_clusters"
+
+Cluster_markers <- FindAllMarkers(Seurat_sub, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", max.cells.per.ident = 1000)
+
+top <- Cluster_markers %>% group_by(cluster) %>% top_n(n = 6, wt = avg_log2FC)
+
+DotPlot(Seurat_sub, features = unique(top$gene), group.by = "seurat_clusters")+ scale_colour_gradient2(low = "#053061", mid = "white", high = "#67001F")+RotatedAxis()+coord_flip()
+
+```
+
+
+removal of cluster II
+
+removal of cluster 13 because of low quali cells
+
+```{r}
+Seurat_before_removal_clusters2 <- Seurat_sub
+
+Idents(Seurat_sub) <- "seurat_clusters"
+Seurat_sub <- subset(Seurat_sub, idents = 13, invert = T)
+
+Seurat_sub <- NormalizeData(Seurat_sub,
+                      normalization.method = "LogNormalize",
+                      scale.factor = 10000)
+Seurat_sub <- FindVariableFeatures(Seurat_sub, selection.method = "vst", nfeatures = 2000)
+Seurat_sub <- ScaleData(Seurat_sub, features = VariableFeatures(Seurat_sub), vars.to.regress = "nCount_RNA")
+Seurat_sub <- RunPCA(object = Seurat_sub, verbose = FALSE)
+Seurat_sub <- RunUMAP(object = Seurat_sub,dims=1:30)
+Seurat_sub <- FindNeighbors(Seurat_sub, reduction = "pca", dims = 1:30)
+Seurat_sub <- FindClusters(Seurat_sub, resolution = 1)
+
+```
+
+
+Cell clusters
+
+```{r}
+DimPlot(Seurat_sub, reduction = "umap", label = T, group.by = "seurat_clusters")
+```
+
+marker per cluster
+
+```{r, fig.height=20, fig.width=10}
+Idents(Seurat_sub) <- "seurat_clusters"
+
+Cluster_markers <- FindAllMarkers(Seurat_sub, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", max.cells.per.ident = 1000)
+
+top <- Cluster_markers %>% group_by(cluster) %>% top_n(n = 6, wt = avg_log2FC)
+
+DotPlot(Seurat_sub, features = unique(top$gene), group.by = "seurat_clusters")+ scale_colour_gradient2(low = "#053061", mid = "white", high = "#67001F")+RotatedAxis()+coord_flip()
+
+```
+
+```{r, fig.width=10, fig.height=22}
+FeaturePlot(Seurat_sub, c("IL7R", "CD3D", "CD8A", "GNLY", "MS4A1", "LYZ", "CD14", "FCGR3A", "FCER1A",  "PPBP", "CLC", "EAF2" ), ncol = 2)
+```
+
+ --------------------------------------
+
+
+Subsetting Lymphocytes and define clusters
+
+```{r}
+seurat_lympho <- subset(Seurat_sub, idents = c(1, 2, 3, 5, 10, 11, 12, 17))
+
+
+seurat_lympho <- NormalizeData(seurat_lympho,
+                      normalization.method = "LogNormalize",
+                      scale.factor = 10000)
+seurat_lympho <- FindVariableFeatures(seurat_lympho, selection.method = "vst", nfeatures = 2000)
+seurat_lympho <- ScaleData(seurat_lympho, features = VariableFeatures(seurat_lympho), vars.to.regress = "nCount_RNA")
+seurat_lympho <- RunPCA(object = seurat_lympho, verbose = FALSE)
+seurat_lympho <- RunUMAP(object = seurat_lympho,dims=1:30)
+seurat_lympho <- FindNeighbors(seurat_lympho, reduction = "pca", dims = 1:30)
+seurat_lympho <- FindClusters(seurat_lympho, resolution = 1)
+
+DimPlot(seurat_lympho, reduction = "umap", label = T, group.by = "seurat_clusters")
+```
+
+
+marker per cluster
+
+```{r, fig.height=18, fig.width=8}
+Idents(seurat_lympho) <- "seurat_clusters"
+
+Cluster_markers <- FindAllMarkers(seurat_lympho, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", max.cells.per.ident = 1000)
+
+top <- Cluster_markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+
+DotPlot(seurat_lympho, features = unique(top$gene), group.by = "seurat_clusters")+ scale_colour_gradient2(low = "#053061", mid = "white", high = "#67001F")+RotatedAxis()+coord_flip()
+
+```
+
+
+2,8 - NK
+10 - Prol. cells
+
+6, 1, 5 - CD8
+0, 3, 4 - CD4
+
+7, 11 - removal (contamination. monocyte/DC like)
+
+```{r}
+DotPlot(seurat_lympho, features = c("CD4", "IL7R", "TCF7", "LTB", "MAL", "LEF1", "CCL5", "CD8A", "GZMH", "NKG7", "TRGC2", "CD247", "TSHZ2", "PDE3B", "SKAP1", "ARHGAP15", "STMN1", "TUBA1B", "TUBB", "MKI67", "HMGB2", "GNLY", "PRF1", "FGFBP2", "SPON2"), group.by = "seurat_clusters")+ scale_colour_gradient2(low = "#053061", mid = "white", high = "#67001F")+coord_flip()
+```
+
+lymphocyte - cell classification
+
+2,8 - NK
+10 - Prol. cells
+
+6, 1, 5 - CD8
+0, 3, 4 - CD4
+
+7, 11 - removal (contamination. monocyte/DC like)
+
+```{r}
+seurat_lympho@meta.data[seurat_lympho@meta.data$seurat_clusters %in% c(2, 8), "cell_type"] <- "NK cells"
+seurat_lympho@meta.data[seurat_lympho@meta.data$seurat_clusters %in% c(10), "cell_type"] <- "Prol. cells"
+seurat_lympho@meta.data[seurat_lympho@meta.data$seurat_clusters %in% c(6, 1, 5, 9), "cell_type"] <- "CD8 T cells"
+seurat_lympho@meta.data[seurat_lympho@meta.data$seurat_clusters %in% c(0, 3, 4), "cell_type"] <- "CD4 T cells"
+
+seurat_lympho@meta.data[seurat_lympho@meta.data$seurat_clusters %in% c(7, 11), "cell_type"] <- "removal"
+
+```
+
+
+```{r}
+seurat_lympho_before_removal <- seurat_lympho
+Idents(seurat_lympho) <- "cell_type"
+seurat_lympho <- subset(seurat_lympho, idents = "removal", invert = T)
+seurat_lympho
+# 16,407 cells remain
+```
+
+```{r}
+seurat_lympho <- NormalizeData(seurat_lympho,
+                      normalization.method = "LogNormalize",
+                      scale.factor = 10000)
+seurat_lympho <- FindVariableFeatures(seurat_lympho, selection.method = "vst", nfeatures = 2000)
+seurat_lympho <- ScaleData(seurat_lympho, features = VariableFeatures(seurat_lympho), vars.to.regress = "nCount_RNA")
+seurat_lympho <- RunPCA(object = seurat_lympho, verbose = FALSE)
+seurat_lympho <- RunUMAP(object = seurat_lympho,dims=1:30)
+seurat_lympho <- FindNeighbors(seurat_lympho, reduction = "pca", dims = 1:30)
+seurat_lympho <- FindClusters(seurat_lympho, resolution = 1)
+
+DimPlot(seurat_lympho, reduction = "umap", label = T, group.by = "seurat_clusters")
+```
+
+marker per cluster
+
+```{r, fig.height=18, fig.width=8}
+Idents(seurat_lympho) <- "seurat_clusters"
+
+Cluster_markers <- FindAllMarkers(seurat_lympho, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", max.cells.per.ident = 1000)
+
+top <- Cluster_markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+
+DotPlot(seurat_lympho, features = unique(top$gene), group.by = "seurat_clusters")+ scale_colour_gradient2(low = "#053061", mid = "white", high = "#67001F")+RotatedAxis()+coord_flip()
+
+```
+
+
+12, 13 - removal (contamination. monocyte-like)
+
+```{r}
+seurat_lympho@meta.data[seurat_lympho@meta.data$seurat_clusters %in% c(12, 13), "cell_type"] <- "removal"
+
+seurat_lympho_before_removal2 <- seurat_lympho
+Idents(seurat_lympho) <- "cell_type"
+seurat_lympho <- subset(seurat_lympho, idents = "removal", invert = T)
+seurat_lympho
+# 16,333 cells remain
+```
+
+
+ --------------------------------------
+
+subsetting known cell types
+
+clusters from Seruat_sub:
+8 - B cells
+13 - Plasmablasts
+
+18 - pDCs
+19 - neutrophils
+
+```{r}
+seurat_B <- subset(Seurat_sub, idents = 8)
+seurat_B$cell_type <- "B cells"
+
+seurat_Plasma <- subset(Seurat_sub, idents = 13)
+seurat_Plasma$cell_type <- "Plasmablasts"
+
+seurat_pDC <- subset(Seurat_sub, idents = 18)
+seurat_pDC$cell_type <- "pDCs"
+
+seurat_Neutro <- subset(Seurat_sub, idents = 19)
+seurat_Neutro$cell_type <- "Neutrophils"
+```
+
+ --------------------------------------
+
+
+subsetting DC Eos
+
+```{r}
+seurat_DC_Eos <- subset(Seurat_sub, idents = 15)
+
+seurat_DC_Eos <- NormalizeData(seurat_DC_Eos,
+                      normalization.method = "LogNormalize",
+                      scale.factor = 10000)
+seurat_DC_Eos <- FindVariableFeatures(seurat_DC_Eos, selection.method = "vst", nfeatures = 2000)
+seurat_DC_Eos <- ScaleData(seurat_DC_Eos, features = VariableFeatures(seurat_DC_Eos), vars.to.regress = "nCount_RNA")
+seurat_DC_Eos <- RunPCA(object = seurat_DC_Eos, verbose = FALSE)
+seurat_DC_Eos <- RunUMAP(object = seurat_DC_Eos,dims=1:30)
+seurat_DC_Eos <- FindNeighbors(seurat_DC_Eos, reduction = "pca", dims = 1:30)
+seurat_DC_Eos <- FindClusters(seurat_DC_Eos, resolution = 1)
+
+DimPlot(seurat_DC_Eos, reduction = "umap", label = T, group.by = "seurat_clusters")
+```
+
+marker per cluster
+
+```{r, fig.height=8, fig.width=4}
+Idents(seurat_DC_Eos) <- "seurat_clusters"
+
+Cluster_markers <- FindAllMarkers(seurat_DC_Eos, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", max.cells.per.ident = 1000)
+
+top <- Cluster_markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+
+DotPlot(seurat_DC_Eos, features = unique(top$gene), group.by = "seurat_clusters")+ scale_colour_gradient2(low = "#053061", mid = "white", high = "#67001F")+RotatedAxis()+coord_flip()
+
+```
+
+```{r}
+seurat_DC_Eos@meta.data[seurat_DC_Eos@meta.data$seurat_clusters %in% c(0, 1, 2), "cell_type"] <- "mDCs"
+seurat_DC_Eos@meta.data[seurat_DC_Eos@meta.data$seurat_clusters %in% c(3), "cell_type"] <- "Eosinophils"
+```
+
+ --------------------------------------
+
+subsetting Megakaryocytes
+
+```{r}
+seurat_Mega <- subset(Seurat_sub, idents = 7)
+
+seurat_Mega <- NormalizeData(seurat_Mega,
+                      normalization.method = "LogNormalize",
+                      scale.factor = 10000)
+seurat_Mega <- FindVariableFeatures(seurat_Mega, selection.method = "vst", nfeatures = 2000)
+seurat_Mega <- ScaleData(seurat_Mega, features = VariableFeatures(seurat_Mega), vars.to.regress = "nCount_RNA")
+seurat_Mega <- RunPCA(object = seurat_Mega, verbose = FALSE)
+seurat_Mega <- RunUMAP(object = seurat_Mega,dims=1:30)
+seurat_Mega <- FindNeighbors(seurat_Mega, reduction = "pca", dims = 1:30)
+seurat_Mega <- FindClusters(seurat_Mega, resolution = 1.5)
+
+
+DimPlot(seurat_Mega, reduction = "umap", label = T, group.by = "seurat_clusters")
+```
+
+marker per cluster
+
+```{r, fig.height=8, fig.width=6}
+Idents(seurat_Mega) <- "seurat_clusters"
+
+Cluster_markers <- FindAllMarkers(seurat_Mega, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", max.cells.per.ident = 1000)
+
+top <- Cluster_markers %>% group_by(cluster) %>% top_n(n = 5, wt = avg_log2FC)
+
+DotPlot(seurat_Mega, features = unique(top$gene), group.by = "seurat_clusters")+ scale_colour_gradient2(low = "#053061", mid = "white", high = "#67001F")+RotatedAxis()+coord_flip()
+
+```
+
+```{r}
+seurat_Mega@meta.data[seurat_Mega@meta.data$seurat_clusters %in% c(1, 2, 3, 4, 5, 6), "cell_type"] <- "Megakaryocytes"
+seurat_Mega@meta.data[seurat_Mega@meta.data$seurat_clusters %in% c(7), "cell_type"] <- "removal"
+seurat_Mega@meta.data[seurat_Mega@meta.data$seurat_clusters %in% c(0), "cell_type"] <- "removal"
+
+```
+
+```{r}
+seurat_Mega_before_removal <- seurat_Mega
+Idents(seurat_Mega) <- "cell_type"
+seurat_Mega <- subset(seurat_Mega, idents = "removal", invert = T)
+seurat_Mega #1352
+```
+
+
+ --------------------------------------
+
+
+subetting monocytes
+
+```{r}
+seurat_mono <- subset(Seurat_sub, idents = c(0, 4, 6, 9, 14, 16))
+
+
+seurat_mono <- NormalizeData(seurat_mono,
+                      normalization.method = "LogNormalize",
+                      scale.factor = 10000)
+seurat_mono <- FindVariableFeatures(seurat_mono, selection.method = "vst", nfeatures = 2000)
+seurat_mono <- ScaleData(seurat_mono, features = VariableFeatures(seurat_mono), vars.to.regress = "nCount_RNA")
+seurat_mono <- RunPCA(object = seurat_mono, verbose = FALSE)
+seurat_mono <- RunUMAP(object = seurat_mono,dims=1:30)
+seurat_mono <- FindNeighbors(seurat_mono, reduction = "pca", dims = 1:30)
+seurat_mono <- FindClusters(seurat_mono, resolution = 1)
+
+DimPlot(seurat_mono, reduction = "umap", label = T, group.by = "seurat_clusters")
+
+```
+
+marker per cluster
+
+```{r, fig.height=18, fig.width=8}
+Idents(seurat_mono) <- "seurat_clusters"
+
+Cluster_markers <- FindAllMarkers(seurat_mono, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", max.cells.per.ident = 1000)
+
+top <- Cluster_markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+
+DotPlot(seurat_mono, features = unique(top$gene), group.by = "seurat_clusters")+ scale_colour_gradient2(low = "#053061", mid = "white", high = "#67001F")+RotatedAxis()+coord_flip()
+
+```
+
+5, 6 - non-classical
+8 - bad quality = removal
+1, 2, 3, 7, 9 - classical
+ 0, 4 - show marker of other cell types -> removal_eventually
+
+```{r, fig.height=18, fig.width=8}
+DotPlot(seurat_mono, features = c("HLA-DRA", "HLA-DRB1", "LYZ", "CST3", "TYROBP", "AP1S2","CSTA", "FCN1", "MS4A6A", "LST1", "CYBB", "CTSS", "DUSP6",  "SGK1", "KLF4", "CLEC7A", "ATP2B1-AS1", "MARCKS", "SAT1", "MYADM", "IFI27", "IFITM3", "ISG15", "APOBEC3A", "IFI6", "TNSF10", "MT2A", "MX1", "IFIT3", "MNDA", "S100A12", "S100A9", "S100A8", "MAFB", "VCAN", "PLBD1", "CXCL8", "RNASE2", "FCGR3A", "MS4A7", "CDKN1C", "AIF1", "COTL1", "FCER1G", "C1QA", "RHOC") , group.by = "seurat_clusters")+ scale_colour_gradient2(low = "#053061", mid = "white", high = "#67001F")+RotatedAxis()+coord_flip()
+
+```
+
+```{r}
+FeaturePlot(seurat_mono, features = "CD14")
+```
+
+5, 6 - non-classical
+8 - bad quality = removal
+1, 2, 3, 7, 9 - classical
+ 0, 4 - show marker of other cell types -> removal_eventually
+
+```{r}
+seurat_mono@meta.data[seurat_mono@meta.data$seurat_clusters %in% c(5, 6), "cell_type"] <- "non-classical Monocytes"
+seurat_mono@meta.data[seurat_mono@meta.data$seurat_clusters %in% c(8), "cell_type"] <- "removal"
+seurat_mono@meta.data[seurat_mono@meta.data$seurat_clusters %in% c(1, 2, 3, 7, 9), "cell_type"] <- "classical Monocytes"
+seurat_mono@meta.data[seurat_mono@meta.data$seurat_clusters %in% c(0, 4), "cell_type"] <- "removal_eventually"
+```
+
+```{r}
+seurat_mono_before_removal <- seurat_mono
+Idents(seurat_mono) <- "cell_type"
+seurat_mono <- subset(seurat_mono, idents = "removal", invert = T)
+seurat_mono
+# 12232 cells remain
+```
+ 
+subsetting remvoal_eventually again
+
+```{r}
+seurat_rm_ev <- subset(seurat_mono, cell_type == "removal_eventually")
+
+
+seurat_rm_ev <- NormalizeData(seurat_rm_ev,
+                      normalization.method = "LogNormalize",
+                      scale.factor = 10000)
+seurat_rm_ev <- FindVariableFeatures(seurat_rm_ev, selection.method = "vst", nfeatures = 2000)
+seurat_rm_ev <- ScaleData(seurat_rm_ev, features = VariableFeatures(seurat_rm_ev), vars.to.regress = "nCount_RNA")
+seurat_rm_ev <- RunPCA(object = seurat_rm_ev, verbose = FALSE)
+seurat_rm_ev <- RunUMAP(object = seurat_rm_ev,dims=1:30)
+seurat_rm_ev <- FindNeighbors(seurat_rm_ev, reduction = "pca", dims = 1:30)
+seurat_rm_ev <- FindClusters(seurat_rm_ev, resolution = 1)
+
+DimPlot(seurat_rm_ev, reduction = "umap", label = T, group.by = "seurat_clusters")
+```
+
+marker per cluster
+
+```{r, fig.height=10, fig.width=5}
+Idents(seurat_rm_ev) <- "seurat_clusters"
+
+Cluster_markers <- FindAllMarkers(seurat_rm_ev, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", max.cells.per.ident = 1000)
+
+top <- Cluster_markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+
+DotPlot(seurat_rm_ev, features = unique(top$gene), group.by = "seurat_clusters")+ scale_colour_gradient2(low = "#053061", mid = "white", high = "#67001F")+RotatedAxis()+coord_flip()
+
+```
+
+rm_ev - cell classification
+
+1, 3- removal
+0 - classical-monocytes
+2- non-classical
+4 - removal, mixed cell type genes 
+5 -IFN
+
+
+```{r}
+seurat_rm_ev@meta.data[seurat_rm_ev@meta.data$seurat_clusters %in% c(0, 5), "cell_type"] <- "classical Monocytes"
+seurat_rm_ev@meta.data[seurat_rm_ev@meta.data$seurat_clusters %in% c(1, 3, 4), "cell_type"] <- "removal"
+seurat_rm_ev@meta.data[seurat_rm_ev@meta.data$seurat_clusters %in% c(2), "cell_type"] <- "non-classical Monocytes"
+```
+
+```{r}
+seurat_rm_ev_before_removal <- seurat_rm_ev
+Idents(seurat_rm_ev) <- "cell_type"
+seurat_rm_ev <- subset(seurat_rm_ev, idents = "removal", invert = T)
+seurat_rm_ev
+# 2438 cells remain
+```
+now remove all remove_eventually from seurat_mono and add the non removal cells
+ 
+```{r}
+seurat_mono <- subset(seurat_mono, cell_type == "removal_eventually", invert = T)
+seurat_mono <- merge(seurat_mono, seurat_rm_ev)
+```
+ 
+ --------------------------------------
+
+
+combination of all cleaned cells
+
+! do not include Eosinophils and Neutrophils due to low cell numbers
+
+```{r}
+seurat_HIV <- merge(seurat_mono, list(seurat_lympho, seurat_B, seurat_Mega, seurat_DC_Eos, seurat_Plasma, seurat_Neutro, seurat_pDC)) 
+
+seurat_HIV <- subset(seurat_HIV, cell_type %in% c("Eosinophils", "Neutrophils"), invert = T)
+
+seurat_HIV #31,805 cells
+
+
+seurat_HIV <- NormalizeData(seurat_HIV,
+                      normalization.method = "LogNormalize",
+                      scale.factor = 10000)
+seurat_HIV <- FindVariableFeatures(seurat_HIV, selection.method = "vst", nfeatures = 2000)
+seurat_HIV <- ScaleData(seurat_HIV, features = VariableFeatures(seurat_HIV), vars.to.regress = "nCount_RNA")
+seurat_HIV <- RunPCA(object = seurat_HIV, verbose = FALSE)
+
+seurat_HIV <- RunUMAP(object = seurat_HIV,dims=1:30, reduction.name = "umap_30PC")
+seurat_HIV <- RunUMAP(object = seurat_HIV,dims=1:20, reduction.name = "umap_20PC")
+seurat_HIV <- RunUMAP(object = seurat_HIV,dims=1:10, reduction.name = "umap_10PC")
+
+DimPlot(seurat_HIV, reduction = "umap_30PC", label = F, group.by = "cell_type", cols = colors_celltype)+ggtitle(paste0("cell number n=", ncol(seurat_HIV)))
+DimPlot(seurat_HIV, reduction = "umap_20PC", label = F, group.by = "cell_type", cols = colors_celltype)+ggtitle(paste0("cell number n=", ncol(seurat_HIV)))
+DimPlot(seurat_HIV, reduction = "umap_10PC", label = F, group.by = "cell_type", cols = colors_celltype)+ggtitle(paste0("cell number n=", ncol(seurat_HIV)))
+
+seurat_HIV <- RunUMAP(object = seurat_HIV,dims=1:20, reduction.name = "umap")
+
+DimPlot(seurat_HIV, reduction = "umap", label = F, group.by = "cell_type", cols = colors_celltype)+ggtitle(paste0("cell number n=", ncol(seurat_HIV)))
+
+
+```
+
+
+
+annotate raw 
+
+```{r, fig.width=5, fig.height=4}
+seurat_HIV$cell_type_raw <- as.character(seurat_HIV$cell_type)
+seurat_HIV@meta.data[seurat_HIV@meta.data$cell_type %in% c("classical Monocytes", "non-classical Monocytes"), "cell_type_raw"] <- "Monocytes"
+seurat_HIV@meta.data[seurat_HIV@meta.data$cell_type %in% c("CD4 T cells"), "cell_type_raw"] <- "CD4 T"
+seurat_HIV@meta.data[seurat_HIV@meta.data$cell_type %in% c("CD8 T cells"), "cell_type_raw"] <- "CD8 T"
+seurat_HIV@meta.data[seurat_HIV@meta.data$cell_type %in% c("mDCs", "pDCs"), "cell_type_raw"] <- "DCs"
+seurat_HIV@meta.data[seurat_HIV@meta.data$cell_type %in% c("Prol. cells"), "cell_type_raw"] <- "prol. cells"
+seurat_HIV@meta.data[seurat_HIV@meta.data$cell_type %in% c("Eosinophils", "Neutrophils"), "cell_type_raw"] <- "other"
+
+colors_celltype_raw <- c("CD8 T" = "#B02457",
+                  "CD4 T" = '#ea7800',
+                  "NK cells" = '#66357D',
+                  "Megakaryocytes" = '#5a6b22',
+                  "B cells" = "#fcc113",
+                  "Monocytes" = "#9dcfcf",
+                  "Plasmablasts" = '#17315f',
+                  "DCs" = "#c16ba8",
+                  "other" = "lightgrey",
+              "prol. cells" = '#9eceaa')
+
+DimPlot(seurat_HIV, reduction = "umap", group.by = "cell_type_raw", cols = colors_celltype_raw)+NoLegend()
+
+```
+
+
+
+
+saving the clean and final object
+
+```{r}
+saveRDS(seurat_HIV, paste("seurat_HIV_final_",Sys.Date(), ".RDS",sep=""))
+```
+
+# -----------------------
+
+# II. Analysis general
+
+# ------------------------
+
+# Figure 3A
+
+```{r, fig.width=4.5, fig.height=4}
+colors_celltype_raw <- c("CD8 T" = "#B02457",
+                  "CD4 T" = '#ea7800',
+                  "NK cells" = '#66357D',
+                  "Megakaryocytes" = '#fcc113',
+                  "B cells" = "#2b6b22",
+                  "Monocytes" = "#9dcfcf",
+                  "Plasmablasts" = '#63b357',
+                  "DCs" = "#17315f",
+              "prol. cells" = '#b572b4')
+
+jpeg("./Figures/20230116_scRNA_HIV_PBMC_UMAP_celltypeNOLegend.jpeg", width = 4.5, height = 4, units = "in", res = 300)
+DimPlot(seurat_HIV, reduction = "umap", group.by = "cell_type_raw", cols = colors_celltype_raw)+NoLegend()
+dev.off()
+
+p <- cowplot::get_legend(DimPlot(seurat_HIV, reduction = "umap", group.by = "cell_type_raw", cols = colors_celltype_raw))
+cairo_pdf("./Figures/20230116_scRNA_HIV_PBMC_UMAP_celltype_Legend.pdf", width = 4, height = 3.5)
+plot(p)
+dev.off()
+
+
+DimPlot(seurat_HIV, reduction = "umap", group.by = "cell_type_raw", cols = colors_celltype_raw)+NoLegend()
+
+```
+
+# Figure S3A
+
+```{r, fig.width=11, fig.height=3.2}
+
+seurat_HIV$cell_type_raw <- factor(seurat_HIV$cell_type_raw, levels = c("Monocytes", "CD8 T", "CD4 T", "NK cells", "prol. cells", "B cells", "Plasmablasts",  "DCs", "Megakaryocytes"))
+
+Idents(seurat_HIV) <- "cell_type_raw"
+
+
+cluster.markers.wilcox <- FindAllMarkers(object = seurat_HIV, 
+                                         only.pos = TRUE, 
+                                         min.pct = 0.2, 
+                                         logfc.threshold = 0.25,
+                                         test.use = "wilcox"
+                                         )
+top <- cluster.markers.wilcox %>% group_by(cluster) %>% top_n(n = 5, wt = avg_log2FC)
+
+p <- DotPlot(seurat_HIV,
+        group.by = "cell_type_raw", 
+        features = unique(top$gene))+ 
+  RotatedAxis()+ 
+  scale_color_gradientn(colors = rev(RColorBrewer::brewer.pal(n =20, name = "RdBu")))+
+  theme(axis.title = element_blank()) + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, face = "italic"))
+
+
+cairo_pdf("./Figures/20230116_scRNA_HIV_PBMC_marker_plot.pdf", width = 11, height = 3.2)
+p
+dev.off()
+
+p
+```
+
+
+# Figure 3B
+
+Status density UMAP
+
+```{r, fig.width=4.5, fig.height=4}
+# control
+coord <- as.data.frame(seurat_HIV@reductions$umap@cell.embeddings)
+annot <- data.frame(row.names = row.names(seurat_HIV@meta.data), cluster = seurat_HIV$Status, stringsAsFactors = F)
+annot$cluster <- as.character(annot$cluster)
+coord <- merge(coord, annot, by=0)
+
+# control
+gg_control <- ggplot(data=coord, aes(x = umap_1, y = umap_2), colour="grey", size=.1)+
+                      geom_point_rast(fill="grey",color="grey",size=.1,alpha=.5)+ 
+                      stat_density_2d(data = coord[coord$cluster %in% "control",],
+                                      aes(x = umap_1, y = umap_2,z=cluster,fill = ..level..), geom="polygon", contour=T, h= 0.5)+
+                      scale_fill_distiller(palette = "Blues",direction = 1)+
+                      theme(legend.position="none")+
+                      ggtitle(paste("control"))+
+                      theme_classic()
+
+
+# HIV
+gg_HIV <- ggplot(data=coord, aes(x = umap_1, y = umap_2), colour="grey", size=.1)+geom_point_rast(fill="grey",color="grey",size=.1,alpha=.5)+ 
+                      stat_density_2d(data = coord[coord$cluster %in% "HIV_pos",],
+                                      aes(x = umap_1, y = umap_2,z=cluster,fill = ..level..), geom="polygon", contour=T, h= 0.5)+
+                      scale_fill_distiller(palette = "Reds",direction = 1)+
+                      theme(legend.position="none")+
+                      ggtitle(paste("HIV"))+
+                      theme_classic()
+
+
+jpeg("./Figures/20230116_scRNAseq_PBMC_control.jpeg", width = 4.5, height = 4, units = "in", res = 300)
+gg_control+NoLegend()
+dev.off()
+
+jpeg("./Figures/20230116_scRNAseq_PBMC_HIV.jpeg", width = 4.5, height = 4, units = "in", res = 300)
+gg_HIV+NoLegend()
+dev.off()
+
+gg_control+NoLegend()
+
+gg_HIV+NoLegend()
+
+```
+
+
+# Figure 3C
+
+DEG calculation
+
+```{r}
+seurat_HIV@meta.data$Cell_ID <-  row.names(seurat_HIV@meta.data)
+
+DEG_list_HIV_vs_control <-list()
+
+meta <- seurat_HIV@meta.data
+meta %>% group_by(cell_type_raw, Status) %>% summarise(n = n()) %>% filter(n<500) %>% pull(cell_type_raw) -> exclude
+celltype_to_show <- unique(seurat_HIV$cell_type_raw)[!unique((seurat_HIV$cell_type_raw)) %in% c(exclude)]
+
+
+
+for (x in celltype_to_show) {
+    print(paste("HIV_vs_control", x, sep="_"))
+    tmp_cell_type <- subset(seurat_HIV, subset = cell_type_raw %in% x)
+    tmp_cell_type <- SetIdent(tmp_cell_type, value = "Status")
+    tryCatch({
+        DEG<-FindMarkers(tmp_cell_type,
+                         ident.1 =  "HIV_pos",
+                         ident.2 = "control" , 
+                         min.pct = 0.1, 
+                         logfc.threshold = 0.25,
+                         test.use = "wilcox", 
+                         slot = "data",
+                         only.pos = F,
+                         verbose = F)
+        DEG$Gene <- rownames(DEG)
+        DEG$regulation <- ifelse(DEG$avg_log2FC<0, "down", "up")
+        DEG$cell_type <- paste(x)
+        DEG$comparison_severity <- paste("HIV_vs_control")
+        DEG$comparison <- paste("HIV_vs_control", x, sep="_")
+        DEG_list_HIV_vs_control[[paste("HIV_vs_control", x, sep="_")]] <- DEG
+      }, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+      
+    }
+  
+DEG_df_HIV_vs_control <- do.call("rbind", DEG_list_HIV_vs_control)
+DEG_df_HIV_vs_control$comparison_reg <- paste(DEG_df_HIV_vs_control$comparison, DEG_df_HIV_vs_control$regulation, sep="-")
+
+DEG_df_HIV_vs_control_celltypes <- DEG_df_HIV_vs_control
+```
+
+change to recreate plot DEG figure 3
+
+
+```{r, fig.width=9, fig.height=4}
+data_sub <- DEG_df_HIV_vs_control_celltypes[DEG_df_HIV_vs_control_celltypes$cell_type %in% c("Monocytes", "CD4 T", "CD8 T", "NK cells", "B cells"), ]
+
+
+data_sub$regulation <- factor(data_sub$regulation, levels = c("up", "down"))
+data_sub$cell_type <- factor(data_sub$cell_type, levels = c("Monocytes", "CD8 T", "CD4 T", "NK cells", "B cells"))
+
+data_sub_signif <- data_sub[data_sub$p_val_adj < 0.05, ]
+
+p <- ggplot(data_sub_signif, aes(x = regulation, fill = regulation))+
+          geom_bar(colour = "black")+
+          geom_text(stat='count', aes(label=..count..), vjust=-1)+
+          theme_bw() + 
+          facet_wrap(~cell_type, nrow = 1, scales = "free_x")+
+          theme(text = element_text(size = 14, color = "black"),
+                plot.title = element_text(size = 16),
+                axis.text.x =  element_text(angle = 60, hjust = 1, vjust = 1))+
+          xlab("")+
+          ggtitle("DE genes per cell type (adj. p<0.05, log2FC = 0.25)")+
+          scale_fill_manual(values = c("up" = "#cb181d", "down" = "#4292c6"))+
+          ylim(c(0,100))
+
+cairo_pdf("./Figures/20230116_scRNA_HIV_DEG_by_celltype.pdf", width = 9, height = 4)
+p
+dev.off()
+
+p
+```
+
+
+# Figure 3D
+
+```{r, fig.height=3.5, fig.width=5.5}
+marker.list<-list()
+
+DEG_mono <- data_sub_signif[data_sub_signif$cell_type == "Monocytes", ]
+
+DEG_mono$cluster <- DEG_mono$regulation
+
+for(i in unique(DEG_mono$cluster)){
+    marker.list[[paste0(i)]]<-DEG_mono[DEG_mono$cluster==i,]$Gene
+}
+
+GOEA_marker<-GOEA.of.list(seurat_object= seurat_HIV,
+             marker.list,
+             GeneSets =c("GO", "Hallmark"#, "Reactome","C_PATHWAYS"
+                         ),
+             GOntology = "BP",
+             pCorrection = "bonferroni",      # choose the p-value adjustment method (Steffi: bonferroni)
+             pvalueCutoff = 0.05,      # set the unadj. or adj. p-value cutoff (depending on correction method)
+             qvalueCutoff = 0.05       # set the q-value cutoff (FDR corrected)
+)
+
+#plot
+GSEA_comb <- rbind(GOEA_marker$HALLMARKresults, GOEA_marker$GOresults)
+GSEA_comb_up <- GSEA_comb[GSEA_comb$Condition == "up", ]
+
+
+dotplot.GOEA.list(GSEA_comb,show = 10, colorBy="padj", orderBy = "count")
+
+
+GSEA_comb_up %>% group_by(Condition) %>% arrange(p.adjust, .by_group = TRUE) -> GSEA_comb_up
+GSEA_comb_up %>% group_by(Condition) %>% arrange(p.adjust, .by_group = TRUE) %>% top_n(n= 10, wt = Count) %>% pull(Description) -> terms
+GSEA_comb_up <- GSEA_comb_up[GSEA_comb_up$Description %in% terms,]
+GSEA_comb_up$Description <- ifelse(nchar(GSEA_comb_up$Description)>80,
+                        paste(substr(GSEA_comb_up$Description, 1, 80),"[...]",sep=""),
+                        GSEA_comb_up$Description)
+
+GSEA_comb_up <- GSEA_comb_up[order(GSEA_comb_up$Count, decreasing = T), ]
+GSEA_comb_up <- GSEA_comb_up[1:10, ]
+GSEA_comb_up$Description <- factor(GSEA_comb_up$Description, levels = rev(GSEA_comb_up$Description))
+
+p <- ggplot(GSEA_comb_up[GSEA_comb_up$Description %in% terms, ], aes(x = Count, y = Description, size = Count, color = p.adjust))+
+  geom_point()+theme_classic()+
+          theme_linedraw()+
+          theme(axis.text.y = element_text(color = "black"),
+                axis.text.x = element_text(angle=90, vjust=0.5,hjust=1, color = "black"),
+                text = element_text(size = 12))+
+          scale_fill_manual(values= c(up = "firebrick3", down = "dodgerblue2"))+
+          xlab("")+ylab("")+
+          #scale_size_area()
+          scale_radius()+
+    scale_colour_gradientn(colours=c('red',
+                                           'orange',
+                                           'darkblue',
+                                           'darkblue'),
+                                 limits=c(0,1),
+                                 values   = c(0,0.05,0.2,0.5,1),
+                                 breaks   = c(0.05,0.2,1),
+                                 labels = format(c(0.05,0.2,1))) +
+          ylab(NULL) +
+          theme_bw() +
+          theme(text = element_text(size=12), 
+                axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+cairo_pdf("./Figures/20230116_scRNA_HIV_GOEA_Monocytes.pdf", width = 5.5, height = 3.5)
+p
+dev.off()
+
+
+p
+        
+```
+
+
+
+# Figure S3B
+
+Overlap PBMC and CD14
+
+```{r}
+up_DEG_mono <- DEG_mono[DEG_mono$avg_log2FC > 0, "Gene"]
+down_DEG_mono <- DEG_mono[DEG_mono$avg_log2FC < 0, "Gene"]
+
+
+DEresults_cd14 <- readRDS("DEresults_cd14.RDS")
+
+up_DEG_CD14 <- DEresults_cd14$HIV_vs_ctrl@DE_genes$up_regulated_Genes
+down_DEG_CD14 <- DEresults_cd14$HIV_vs_ctrl@DE_genes$down_regulated_Genes
+
+
+intersect(up_DEG_mono, up_DEG_CD14$SYMBOL)
+
+intersect(down_DEG_mono, down_DEG_CD14$SYMBOL)
+
+```
+
+```{r}
+library(VennDiagram)
+
+venn.diagram(
+  x = list(up_DEG_mono, up_DEG_CD14$SYMBOL),
+  category.names = c("scRNAseq" , "CD14 bulk"),
+  filename = './Figures/20230116_DEG_sc_bulk_CD14_venn_diagramm.svg', imagetype = "svg", height = 3,width = 3, resolution = 300,
+  output=TRUE
+)
+```
+
+
+# Figure 3E
+
+```{r, fig.width=5, fig.height=3}
+p <- VlnPlot(subset(seurat_HIV, cell_type_raw %in% "Monocytes"), features = c("XAF1", "GBP1"), pt.size = 0, group.by = "Status")
+
+
+cairo_pdf("./Figures/20230116_scRNA_HIV_genes_intersecting_CD14.pdf", width = 5, height = 3)
+p
+dev.off()
+
+
+p 
+```
+
+
+# -----------------------
+
+# III. subset monocytes
+
+# ------------------------
+
+
+```{r}
+DimPlot(seurat_HIV, reduction = "umap", label = F, group.by = "cell_type_raw", cols = colors_mix)+ggtitle(paste0("cell_type n=", ncol(seurat_HIV)))
+
+seurat_HIV_monos <- subset(seurat_HIV, cell_type_raw %in% "Monocytes")
+seurat_HIV_monos #10,672 cells
+```
+
+
+```{r}
+seurat_HIV_monos <- NormalizeData(seurat_HIV_monos,
+                      normalization.method = "LogNormalize",
+                      scale.factor = 10000)
+seurat_HIV_monos <- FindVariableFeatures(seurat_HIV_monos, selection.method = "vst", nfeatures = 3251)
+seurat_HIV_monos <- ScaleData(seurat_HIV_monos, features = VariableFeatures(seurat_HIV_monos), vars.to.regress = "nCount_RNA")
+seurat_HIV_monos <- RunPCA(object = seurat_HIV_monos, features = VariableFeatures(seurat_HIV_monos), verbose = FALSE)
+ElbowPlot(seurat_HIV_monos)
+seurat_HIV_monos <- RunUMAP(object = seurat_HIV_monos, dims=1:10)
+DimPlot(seurat_HIV_monos, group.by = "cell_type_raw")
+
+
+seurat_HIV_monos <- FindNeighbors(seurat_HIV_monos, reduction = "pca", dims = 1:10)
+seurat_HIV_monos <- FindClusters(seurat_HIV_monos, resolution = 0.4) 
+
+DimPlot(seurat_HIV_monos, reduction = "umap", label = T, group.by = "seurat_clusters", cols = colors_mix)+ggtitle(paste0("seurat clusters (res0.5) n=", ncol(seurat_HIV_monos)))
+DimPlot(seurat_HIV_monos, reduction = "umap", label = F, group.by = "cell_type_raw", cols = colors_mix)+ggtitle(paste0("cell_type n=", ncol(seurat_HIV_monos)))
+
+```
+
+
+```{r, fig.height=10, fig.width=6}
+Idents(seurat_HIV_monos) <- "seurat_clusters"
+
+Cluster_markers <- FindAllMarkers(seurat_HIV_monos, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", max.cells.per.ident = 1000)
+
+top <- Cluster_markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+
+DotPlot(seurat_HIV_monos, features = unique(top$gene), group.by = "seurat_clusters")+ scale_colour_gradient2(low = "#053061", mid = "white", high = "#67001F")+RotatedAxis()+coord_flip()
+
+```
+
+
+
+
+# -----------------------
+
+# IV. Kazer et al 2020 data
+
+# ------------------------
+
+loading the Kazer et al HIV 2020 counts, normalized data and tSNE dimensional reduction
+
+```{r}
+counts <- read.delim("~/data/Analysis/Rainer/Shalek_scRNA/raw_counts_matrix_040220.txt")
+norm.data <- read.delim("~/data/Analysis/Rainer/Shalek_scRNA/log_normalized_matrix_012020.txt")
+meta <- read.delim("~/data/Analysis/Rainer/Shalek_scRNA/meta.txt", header = T)
+meta <- meta[-1,]
+row.names(meta) <- meta$NAME
+
+counts[1:4,1:4]
+row.names(counts) <- counts$GENE
+counts$GENE <- NULL
+
+norm.data[1:4,1:4]
+row.names(norm.data) <- norm.data$GENE
+norm.data$GENE <- NULL
+```
+
+
+```{r}
+seurat_kazer <- CreateSeuratObject(counts = counts, meta.data =  meta)
+
+seurat_kazer@assays$RNA@counts[1:4,1:4]
+
+# add normalized data from publication
+m <- as.matrix(norm.data)
+m <- as(m, "dgCMatrix") 
+
+genes <- row.names(seurat_kazer@assays$RNA@data)
+m <- m[row.names(m) %in% genes,]
+
+seurat_kazer@assays$RNA@data <- m
+```
+
+
+```{r}
+seurat_kazer <- FindVariableFeatures(seurat_kazer, selection.method = "vst", nfeatures = 3251)
+seurat_kazer <- ScaleData(seurat_kazer, features = VariableFeatures(seurat_kazer), do.center = F)
+seurat_kazer <- RunPCA(object = seurat_kazer, features = VariableFeatures(seurat_kazer), verbose = FALSE)
+seurat_kazer <- RunUMAP(object = seurat_kazer,dims=1:17)
+
+DimPlot(seurat_kazer, reduction = "umap", label = F, group.by = "study_celltype_label", cols = colors_mix)+ggtitle(paste0("cell_type n=", ncol(seurat_kazer)))
+DimPlot(seurat_kazer, reduction = "umap", label = F, group.by = "disease__ontology_label", cols = colors_mix)+ggtitle(paste0("disease__ontology_label n=", ncol(seurat_kazer)))
+
+```
+
+```{r}
+seurat_kazer@meta.data[seurat_kazer@meta.data$study_celltype_label %in% c("B"), "cell_type_raw"] <- "B cells"
+seurat_kazer@meta.data[seurat_kazer@meta.data$study_celltype_label %in% c("CD4"), "cell_type_raw"] <- "CD4 T"
+seurat_kazer@meta.data[seurat_kazer@meta.data$study_celltype_label %in% c("CTL"), "cell_type_raw"] <- "CD8 T"
+seurat_kazer@meta.data[seurat_kazer@meta.data$study_celltype_label %in% c("DC"), "cell_type_raw"] <- "DCs"
+seurat_kazer@meta.data[seurat_kazer@meta.data$study_celltype_label %in% c("Mono"), "cell_type_raw"] <- "Monocytes"
+seurat_kazer@meta.data[seurat_kazer@meta.data$study_celltype_label %in% c("NK"), "cell_type_raw"] <- "NK cells"
+seurat_kazer@meta.data[seurat_kazer@meta.data$study_celltype_label %in% c("PB"), "cell_type_raw"] <- "Plasmablasts"
+seurat_kazer@meta.data[seurat_kazer@meta.data$study_celltype_label %in% c("Prolif.T"), "cell_type_raw"] <- "prol. cells"
+
+
+DimPlot(seurat_kazer, reduction = "umap", label = F, group.by = "cell_type_raw", cols = colors_mix)+ggtitle(paste0("cell_type n=", ncol(seurat_kazer)))
+
+```
+
+
+
+# -----------------------
+
+# V. merge data
+
+# ------------------------
+
+```{r}
+seurat_HIV$dataset <- "chronic_HIV"
+
+seurat_kazer$dataset <- "acute_HIV"
+```
+
+subset our chronic HIV data to only have similar cell types
+
+```{r}
+seurat_HIV_sub <- subset(seurat_HIV, cell_type_raw %in% unique(seurat_kazer$cell_type_raw))
+
+DimPlot(seurat_HIV_sub, reduction = "umap", label = F, group.by = "cell_type_raw", cols = colors_mix)+ggtitle(paste0("cell_type n=", ncol(seurat_HIV_sub)))
+
+```
+
+
+harmonize disease labels and downsample to common genes
+
+```{r}
+
+seurat_kazer@meta.data[seurat_kazer@meta.data$disease__ontology_label %in% c("HIV infectious disease"), "Status"] <- "HIV_pos"
+seurat_kazer@meta.data[seurat_kazer@meta.data$disease__ontology_label %in% c("disease or disorder"), "Status"] <- "control"
+
+genes_intersect <- intersect(row.names(seurat_HIV_sub@assays$RNA@counts), row.names(seurat_kazer@assays$RNA@counts))
+seurat_kazer@assays$RNA@counts <- seurat_kazer@assays$RNA@counts[row.names(seurat_kazer@assays$RNA@counts) %in% genes_intersect, ]
+seurat_kazer@assays$RNA@data <- seurat_kazer@assays$RNA@data[row.names(seurat_kazer@assays$RNA@data) %in% genes_intersect, ]
+
+seurat_HIV_sub@assays$RNA@counts <- seurat_HIV_sub@assays$RNA@counts[row.names(seurat_HIV_sub@assays$RNA@counts) %in% genes_intersect, ]
+seurat_HIV_sub@assays$RNA@data <- seurat_HIV_sub@assays$RNA@data[row.names(seurat_HIV_sub@assays$RNA@data) %in% genes_intersect, ]
+
+seurat_merge <- merge(seurat_HIV_sub, seurat_kazer)
+seurat_merge # 89,500 cells
+```
+
+
+```{r}
+seurat_merge <- NormalizeData(seurat_merge,
+                      normalization.method = "LogNormalize",
+                      scale.factor = 10000)
+
+seurat_merge <- FindVariableFeatures(seurat_merge, selection.method = "vst", nfeatures = 3000)
+seurat_merge <- ScaleData(seurat_merge, features = VariableFeatures(seurat_merge), vars.to.regress = "nCount_RNA")
+seurat_merge <- RunPCA(object = seurat_merge, features = VariableFeatures(seurat_merge), verbose = FALSE)
+
+ElbowPlot(seurat_merge)
+
+seurat_merge <- RunUMAP(object = seurat_merge,dims=1:15)
+
+DimPlot(seurat_merge, reduction = "umap", label = F, group.by = "dataset", cols = colors_mix)+ggtitle(paste0("dataset n=", ncol(seurat_merge)))
+
+```
+
+```{r}
+seurat_merge <- RunHarmony(object = seurat_merge, group.by.vars = "dataset")
+seurat_merge <- RunUMAP(object = seurat_merge, dims = 1:15, reduction = "harmony")
+
+
+DimPlot(seurat_merge, reduction = "umap", label = F, group.by = "dataset", cols = colors_mix, order = T)+ggtitle(paste0("dataset n=", ncol(seurat_merge)))
+
+```
+
+# Figure 3F
+
+```{r, fig.width=4.5, fig.height=4}
+p <- DimPlot(seurat_merge, reduction = "umap", label = F, group.by = "cell_type_raw", cols = colors_celltype_raw)+ggtitle(paste0("Status n=", ncol(seurat_merge)))+NoLegend()
+
+jpeg("./Figures/20230117_scRNA_HIV_integrated_PBMC_UMAP_celltypeNOLegend.jpeg", width = 4.5, height = 4, units = "in", res = 300)
+p
+dev.off()
+
+```
+
+# Figure S3C
+
+```{r, fig.width=4.5, fig.height=4}
+p1 <- DimPlot(seurat_merge, reduction = "umap", label = F, group.by = "dataset",  cells.highlight = sample(colnames(seurat_HIV_sub), 30000), cols.highlight = "#c51b8a", sizes.highlight = 0.1)+ggtitle("chronic HIV")+NoLegend()
+
+
+p2 <- DimPlot(seurat_merge, reduction = "umap", label = F, group.by = "dataset",  cells.highlight = sample(colnames(seurat_kazer), 30000), cols.highlight = "#31a354", sizes.highlight = 0.1)+ggtitle("acute HIV")+NoLegend()
+
+
+
+
+jpeg("./Figures/20230117_scRNA_HIV_integrated_PBMC_UMAP_chronicHIV.jpeg", width = 4.5, height = 4, units = "in", res = 300)
+p1
+dev.off()
+
+
+jpeg("./Figures/20230117_scRNA_HIV_integrated_PBMC_UMAP_acuteHIV.jpeg", width = 4.5, height = 4, units = "in", res = 300)
+p2
+dev.off()
+
+
+p1
+p2
+```
+
+
+# Figure S3D
+
+```{r, fig.height=2.7, fig.width=9.5}
+seurat_merge$cell_type_raw <- factor(seurat_merge$cell_type_raw, levels = c("Monocytes", "CD8 T", "CD4 T", "NK cells", "prol. cells", "B cells", "Plasmablasts",  "DCs"))
+
+
+Idents(seurat_merge) <- "cell_type_raw"
+
+Cluster_markers <- FindAllMarkers(seurat_merge, only.pos = TRUE, min.pct = 0.2, logfc.threshold = 0.25, assay = "RNA", max.cells.per.ident = 2000)
+
+top <- Cluster_markers %>% group_by(cluster) %>% top_n(n = 5, wt = avg_log2FC)
+
+p <- DotPlot(seurat_merge,
+        group.by = "cell_type_raw", 
+        features = unique(top$gene))+ 
+  RotatedAxis()+ 
+  scale_color_gradientn(colors = rev(RColorBrewer::brewer.pal(n =20, name = "RdBu")))+
+  theme(axis.title = element_blank()) + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, face = "italic"))
+
+
+cairo_pdf("./Figures/20230117_scRNA_HIV_integrated_PBMC_marker_plot.pdf", width = 9.5, height = 2.7)
+p
+dev.off()
+
+p
+
+```
+
+
+# -----------------------
+
+# V. subset integrated monocytes
+
+# ------------------------
+
+```{r}
+seurat_merge_mono <- subset(seurat_merge, cell_type_raw %in% "Monocytes")
+seurat_merge_mono # 39,803 cells
+```
+
+```{r}
+seurat_merge_mono$IL1B <- NULL
+seurat_merge_mono <- NormalizeData(seurat_merge_mono,
+                      normalization.method = "LogNormalize",
+                      scale.factor = 10000)
+
+seurat_merge_mono <- FindVariableFeatures(seurat_merge_mono, selection.method = "vst", nfeatures = 2000)
+seurat_merge_mono <- ScaleData(seurat_merge_mono, features = VariableFeatures(seurat_merge_mono), vars.to.regress = "nCount_RNA")
+seurat_merge_mono <- RunPCA(object = seurat_merge_mono, features = VariableFeatures(seurat_merge_mono), verbose = FALSE)
+
+ElbowPlot(seurat_merge_mono)
+
+seurat_merge_mono <- RunUMAP(object = seurat_merge_mono,dims=1:10)
+
+DimPlot(seurat_merge_mono, reduction = "umap", label = F, group.by = "dataset", cols = colors_mix)+ggtitle(paste0("dataset n=", ncol(seurat_merge_mono)))
+
+```
+
+
+```{r, fig.width=5.5, fig.height=4}
+seurat_merge_mono <- RunHarmony(object = seurat_merge_mono, group.by.vars = "dataset")
+seurat_merge_mono <- RunUMAP(object = seurat_merge_mono, dims = 1:10, reduction = "harmony")
+
+
+
+DimPlot(seurat_merge_mono, reduction = "umap", label = F, group.by = "dataset", cols = colors_mix, order = T)+ggtitle(paste0("dataset n=", ncol(seurat_merge_mono)))
+
+```
+
+
+
+```{r, fig.width=5.5, fig.height=5}
+seurat_merge_mono <- FindNeighbors(seurat_merge_mono, reduction = "harmony", dims = 1:10)
+seurat_merge_mono <- FindClusters(seurat_merge_mono, resolution = 0.3) 
+seurat_merge_mono <- FindClusters(seurat_merge_mono, resolution = 0.4) 
+seurat_merge_mono <- FindClusters(seurat_merge_mono, resolution = 0.5) 
+seurat_merge_mono <- FindClusters(seurat_merge_mono, resolution = 0.6) 
+seurat_merge_mono <- FindClusters(seurat_merge_mono, resolution = 0.8) 
+
+
+
+DimPlot(seurat_merge_mono, reduction = "umap", label = T, group.by = "RNA_snn_res.0.3", cols = colors_mix)+ggtitle(paste0("seurat_clusters n=", ncol(seurat_merge_mono)))
+DimPlot(seurat_merge_mono, reduction = "umap", label = T, group.by = "RNA_snn_res.0.4", cols = colors_mix)+ggtitle(paste0("seurat_clusters n=", ncol(seurat_merge_mono)))
+DimPlot(seurat_merge_mono, reduction = "umap", label = T, group.by = "RNA_snn_res.0.5", cols = colors_mix)+ggtitle(paste0("seurat_clusters n=", ncol(seurat_merge_mono)))
+DimPlot(seurat_merge_mono, reduction = "umap", label = T, group.by = "RNA_snn_res.0.6", cols = colors_mix)+ggtitle(paste0("seurat_clusters n=", ncol(seurat_merge_mono)))
+DimPlot(seurat_merge_mono, reduction = "umap", label = T, group.by = "RNA_snn_res.0.8", cols = colors_mix)+ggtitle(paste0("seurat_clusters n=", ncol(seurat_merge_mono)))
+
+# select 0.6
+seurat_merge_mono <- FindClusters(seurat_merge_mono, resolution = 0.6) 
+
+DimPlot(seurat_merge_mono, reduction = "umap", label = T, group.by = "seurat_clusters", cols = colors_mix)+ggtitle(paste0("seurat_clusters n=", ncol(seurat_merge_mono)))
+
+```
+
+subtype genes getting genes from Table S3
+
+
+```{r}
+Resting_Monocytes <- c("S100A8", "VCAN", "S100A9", "S100A12", "LYZ", "MNDA", "CD14", "FCN1") 
+
+Inflammatory_Monocytes <- c("IL8", "IL1B", "EREG", "G0S2", "CXCL2", "PLAUR", "SOD2", "CCL3", "CXCL3") 
+
+Non_Classical_Monocytes <- c("FCGR3A", "MS4A7", "LST1", "C1QA", "CDKN1C", "AIF1")
+
+Anti_Viral_Monocytes <- c("TNFSF10", "CXCL10", "ISG15", "IFIT3", "IFIT2", "APOBEC3A", "IFIT1", "IFITM3")
+
+Anti_Viral_Inflammatory_Monocytes <- c("CCL2", "C15orf48" ,"IL1B" ,"CCL4" ,"CXCL10", "APOBEC3A")
+```
+
+
+```{r, fig.height=5, fig.width=6}
+DotPlot(seurat_merge_mono, 
+        features = Resting_Monocytes, 
+        group.by = "seurat_clusters", col.max = 1.5, col.min = -1.5)+ 
+  scale_colour_gradient2(low = "#3288bd", mid = "white", high = "#67001F")+
+  theme(axis.text.x = element_text(size = 14, angle = 90, hjust = 1), legend.position = "bottom")+
+  ggtitle("Resting_Monocytes")
+
+
+DotPlot(seurat_merge_mono, 
+        features = Inflammatory_Monocytes, 
+        group.by = "seurat_clusters", col.max = 1.5, col.min = -1.5)+ 
+  scale_colour_gradient2(low = "#3288bd", mid = "white", high = "#67001F")+
+  theme(axis.text.x = element_text(size = 14, angle = 90, hjust = 1), legend.position = "bottom")+
+  ggtitle("Inflammatory_Monocytes")
+
+DotPlot(seurat_merge_mono, 
+        features = Non_Classical_Monocytes, 
+        group.by = "seurat_clusters", col.max = 1.5, col.min = -1.5)+ 
+  scale_colour_gradient2(low = "#3288bd", mid = "white", high = "#67001F")+
+  theme(axis.text.x = element_text(size = 14, angle = 90, hjust = 1), legend.position = "bottom")+
+  ggtitle("Non_Classical_Monocytes")
+
+DotPlot(seurat_merge_mono, 
+        features = Anti_Viral_Monocytes, 
+        group.by = "seurat_clusters", col.max = 1.5, col.min = -1.5)+ 
+  scale_colour_gradient2(low = "#3288bd", mid = "white", high = "#67001F")+
+  theme(axis.text.x = element_text(size = 14, angle = 90, hjust = 1), legend.position = "bottom")+
+  ggtitle("Anti_Viral_Monocytes")
+
+
+DotPlot(seurat_merge_mono, 
+        features = Anti_Viral_Inflammatory_Monocytes, 
+        group.by = "seurat_clusters", col.max = 1.5, col.min = -1.5)+ 
+  scale_colour_gradient2(low = "#3288bd", mid = "white", high = "#67001F")+
+  theme(axis.text.x = element_text(size = 14, angle = 90, hjust = 1), legend.position = "bottom")+
+  ggtitle("Anti_Viral_Inflammatory_Monocytes")
+
+```
+
+
+```{r, fig.height=3, fig.width=20}
+Idents(seurat_merge_mono) <- "seurat_clusters"
+
+Cluster_markers <- FindAllMarkers(seurat_merge_mono, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", max.cells.per.ident = 1000)
+
+top <- Cluster_markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+
+DotPlot(seurat_merge_mono, features = unique(top$gene), group.by = "seurat_clusters")+ scale_colour_gradient2(low = "#053061", mid = "white", high = "#67001F")+theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, face = "italic"))
+
+```
+
+definition of monocyte subtypes
+
+```{r}
+seurat_merge_mono$monocyte_states <- "missing"
+
+seurat_merge_mono@meta.data[seurat_merge_mono@meta.data$seurat_clusters %in% c(1, 2), "monocyte_states"] <- "Resting_Monocytes"
+seurat_merge_mono@meta.data[seurat_merge_mono@meta.data$seurat_clusters %in% c(0, 7, 10), "monocyte_states"] <- "Inflammatory_Monocytes"
+seurat_merge_mono@meta.data[seurat_merge_mono@meta.data$seurat_clusters %in% c(4, 9), "monocyte_states"] <- "Non_Classical_Monocytes"
+seurat_merge_mono@meta.data[seurat_merge_mono@meta.data$seurat_clusters %in% c(5, 6), "monocyte_states"] <- "Anti_Viral_Monocytes"
+seurat_merge_mono@meta.data[seurat_merge_mono@meta.data$seurat_clusters %in% c(7), "monocyte_states"] <- "Anti_Viral_Inflammatory_Monocytes"
+
+seurat_merge_mono@meta.data[seurat_merge_mono@meta.data$seurat_clusters %in% c(8), "monocyte_states"] <- "IFIhi_Monocytes"
+seurat_merge_mono@meta.data[seurat_merge_mono@meta.data$seurat_clusters %in% c(3), "monocyte_states"] <- "low_quali_Monocytes"
+```
+
+```{r}
+DimPlot(seurat_merge_mono, reduction = "umap",group.by = "monocyte_states", cols = colors_mix)
+```
+
+
+
+Subsetting Lymphocytes and define clusters
+
+```{r}
+seurat_merge_mono_lowq <- subset(seurat_merge_mono, monocyte_states  == "low_quali_Monocytes")
+
+
+seurat_merge_mono_lowq <- NormalizeData(seurat_merge_mono_lowq,
+                      normalization.method = "LogNormalize",
+                      scale.factor = 10000)
+seurat_merge_mono_lowq <- FindVariableFeatures(seurat_merge_mono_lowq, selection.method = "vst", nfeatures = 3000)
+seurat_merge_mono_lowq <- ScaleData(seurat_merge_mono_lowq, features = VariableFeatures(seurat_merge_mono_lowq), vars.to.regress = "nCount_RNA")
+seurat_merge_mono_lowq <- RunPCA(object = seurat_merge_mono_lowq, verbose = FALSE)
+ElbowPlot(seurat_merge_mono_lowq)
+
+
+seurat_merge_mono_lowq <- RunHarmony(object = seurat_merge_mono_lowq, group.by.vars = "dataset")
+seurat_merge_mono_lowq <- RunUMAP(object = seurat_merge_mono_lowq, dims = 1:10, reduction = "harmony")
+
+DimPlot(seurat_merge_mono_lowq, reduction = "umap", label = F, group.by = "dataset", cols = colors_mix, order = T)
+
+seurat_merge_mono_lowq <- FindNeighbors(seurat_merge_mono_lowq, reduction = "harmony", dims = 1:10)
+seurat_merge_mono_lowq <- FindClusters(seurat_merge_mono_lowq, resolution = 0.5)
+
+DimPlot(seurat_merge_mono_lowq, reduction = "umap", label = T, group.by = "seurat_clusters")
+```
+
+
+```{r, fig.height=5, fig.width=6}
+DotPlot(seurat_merge_mono_lowq, 
+        features = Resting_Monocytes, 
+        group.by = "seurat_clusters", col.max = 1.5, col.min = -1.5)+ 
+  scale_colour_gradient2(low = "#3288bd", mid = "white", high = "#67001F")+
+  theme(axis.text.x = element_text(size = 14, angle = 90, hjust = 1), legend.position = "bottom")+
+  ggtitle("Resting_Monocytes")
+
+
+DotPlot(seurat_merge_mono_lowq, 
+        features = Inflammatory_Monocytes, 
+        group.by = "seurat_clusters", col.max = 1.5, col.min = -1.5)+ 
+  scale_colour_gradient2(low = "#3288bd", mid = "white", high = "#67001F")+
+  theme(axis.text.x = element_text(size = 14, angle = 90, hjust = 1), legend.position = "bottom")+
+  ggtitle("Inflammatory_Monocytes")
+
+DotPlot(seurat_merge_mono_lowq, 
+        features = Non_Classical_Monocytes, 
+        group.by = "seurat_clusters", col.max = 1.5, col.min = -1.5)+ 
+  scale_colour_gradient2(low = "#3288bd", mid = "white", high = "#67001F")+
+  theme(axis.text.x = element_text(size = 14, angle = 90, hjust = 1), legend.position = "bottom")+
+  ggtitle("Non_Classical_Monocytes")
+
+DotPlot(seurat_merge_mono_lowq, 
+        features = Anti_Viral_Monocytes, 
+        group.by = "seurat_clusters", col.max = 1.5, col.min = -1.5)+ 
+  scale_colour_gradient2(low = "#3288bd", mid = "white", high = "#67001F")+
+  theme(axis.text.x = element_text(size = 14, angle = 90, hjust = 1), legend.position = "bottom")+
+  ggtitle("Anti_Viral_Monocytes")
+
+
+DotPlot(seurat_merge_mono_lowq, 
+        features = Anti_Viral_Inflammatory_Monocytes, 
+        group.by = "seurat_clusters", col.max = 1.5, col.min = -1.5)+ 
+  scale_colour_gradient2(low = "#3288bd", mid = "white", high = "#67001F")+
+  theme(axis.text.x = element_text(size = 14, angle = 90, hjust = 1), legend.position = "bottom")+
+  ggtitle("Anti_Viral_Inflammatory_Monocytes")
+
+```
+
+marker per cluster
+
+```{r, fig.height=18, fig.width=8}
+Idents(seurat_merge_mono_lowq) <- "seurat_clusters"
+
+Cluster_markers <- FindAllMarkers(seurat_merge_mono_lowq, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, assay = "RNA", max.cells.per.ident = 1000)
+
+top <- Cluster_markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+
+DotPlot(seurat_merge_mono_lowq, features = unique(top$gene), group.by = "seurat_clusters")+ scale_colour_gradient2(low = "#053061", mid = "white", high = "#67001F")+RotatedAxis()+coord_flip()
+
+```
+
+
+```{r}
+seurat_merge_mono$cell_ID <- Cells(seurat_merge_mono)
+
+seurat_merge_mono@meta.data[seurat_merge_mono@meta.data$cell_ID %in% Cells(subset(seurat_merge_mono_lowq, seurat_clusters %in% c(3))), 
+                            "monocyte_states"] <- "Inflammatory_Monocytes"
+seurat_merge_mono@meta.data[seurat_merge_mono@meta.data$cell_ID %in% Cells(subset(seurat_merge_mono_lowq, seurat_clusters %in% c(0, 1, 5, 6))), 
+                            "monocyte_states"] <- "Resting_Monocytes"
+seurat_merge_mono@meta.data[seurat_merge_mono@meta.data$cell_ID %in% Cells(subset(seurat_merge_mono_lowq, seurat_clusters %in% c(4))), 
+                            "monocyte_states"] <- "Anti_Viral_Monocytes"
+seurat_merge_mono@meta.data[seurat_merge_mono@meta.data$cell_ID %in% Cells(subset(seurat_merge_mono_lowq, seurat_clusters %in% c(2))),
+                            "monocyte_states"] <- "low_quali_Monocytes"
+
+```
+
+
+```{r}
+DimPlot(seurat_merge_mono, reduction = "umap",group.by = "monocyte_states", cols = colors_mix)
+```
+
+# Figure 3G
+
+```{r, fig.width=4, fig.height=4}
+
+colors_mono_subtype = c("Resting_Monocytes" = "#9dcfcf",
+                        "Inflammatory_Monocytes" = "#9C002E",
+                        "Non_Classical_Monocytes" = "#449FBB",
+                        "Anti_Viral_Monocytes" = "#1a7341",
+                        "Anti_Viral_Inflammatory_Monocytes" = "#7D2C54", 
+                        "IFIhi_Monocytes" = "#FF99FF",
+                        "HLAhi_Monocytes" = "#4D39D1",
+                        "low_quali_Monocytes" = "#808080")
+
+
+DimPlot(seurat_merge_mono, reduction = "umap", label = F, group.by = "monocyte_states", cols = colors_mono_subtype, order = F)+ggtitle(paste0("cell_subtype n=", ncol(seurat_merge_mono)))+NoLegend()
+
+
+jpeg("./Figures/20230116_scRNA_HIV_Mono_UMAP_statesNOLegend.jpeg", width = 4, height = 4, units = "in", res = 300)
+DimPlot(seurat_merge_mono, reduction = "umap", label = F, group.by = "monocyte_states", cols = colors_mono_subtype)+ggtitle(paste0("cell_subtype n=", ncol(seurat_merge_mono)))+NoLegend()
+dev.off()
+
+p <- cowplot::get_legend(DimPlot(seurat_merge_mono, reduction = "umap", label = F, group.by = "monocyte_states", cols = colors_mono_subtype)+ggtitle(paste0("cell_subtype n=", ncol(seurat_merge_mono))))
+cairo_pdf("./Figures/20230116_scRNA_HIV_Mono_UMAP_states_Legend.pdf", width = 4, height =4)
+plot(p)
+dev.off()
+```
+# Figure 3H
+
+```{r, fig.width=4, fig.height=4}
+p1 <- DimPlot(seurat_merge_mono, reduction = "umap", label = F, group.by = "dataset",  cells.highlight = sample(colnames(seurat_HIV_sub), 10000), cols.highlight = "#c51b8a", sizes.highlight = 0.5)+ggtitle("chronic HIV")+NoLegend()
+
+
+p2 <- DimPlot(seurat_merge_mono, reduction = "umap", label = F, group.by = "dataset",  cells.highlight = sample(colnames(seurat_kazer), 10000), cols.highlight = "#31a354", sizes.highlight = 0.5)+ggtitle("acute HIV")+NoLegend()
+
+
+
+
+jpeg("./Figures/20230117_scRNA_HIV_integrated_mono_UMAP_chronicHIV.jpeg", width = 4, height = 4, units = "in", res = 300)
+p1
+dev.off()
+
+
+jpeg("./Figures/20230117_scRNA_HIV_integrated_mono_UMAP_acuteHIV.jpeg", width = 4, height = 4, units = "in", res = 300)
+p2
+dev.off()
+
+
+p1
+p2
+```
+
+
+
+
+# Figure 3I
+
+
+```{r, fig.width=5, fig.height=5}
+seurat_merge_mono$dataset_Status <- paste(seurat_merge_mono$dataset, seurat_merge_mono$Status, sep = "_")
+
+
+cells_cluster <- confusionMatrix(paste0(seurat_merge_mono$monocyte_states),
+                                               paste0(seurat_merge_mono$dataset_Status))
+
+cells_cluster <- cells_cluster[order(factor(row.names(cells_cluster),levels = c("Anti_Viral_Monocytes", "Inflammatory_Monocytes", "Anti_Viral_Inflammatory_Monocytes", "IFIhi_Monocytes", "Resting_Monocytes", "Non_Classical_Monocytes", "low_quali_Monocytes"))),
+                                order(factor(colnames(cells_cluster),levels = c("chronic_HIV_control", "chronic_HIV_HIV_pos", "acute_HIV_control", "acute_HIV_HIV_pos")))]
+
+# normalize to 1000 cells per sample
+tmp <- round(t(t(cells_cluster)/colSums(cells_cluster))*1000,3)
+
+# calculate percentage of cells from sample per cluster
+scaled_cM <- round((tmp / Matrix::rowSums(tmp))*100,2)
+
+
+cairo_pdf("./Figures/20230117_scRNA_HIV_integrated_mono_confusion_heatmap.pdf", width = 5, height = 5)
+p <- pheatmap::pheatmap(
+     mat = as.matrix(scaled_cM),
+     border_color = "black",display_numbers = TRUE,
+     cluster_rows = FALSE,cluster_cols = FALSE, angle_col = 90, gaps_col = 2, number_color = "black")
+
+p
+dev.off()
+
+
+```
+
+
+# Figure S3E
+
+```{r, fig.width=10.5, fig.height=2.7}
+seurat_merge_mono$monocyte_states <- factor(seurat_merge_mono$monocyte_states, levels = c("Anti_Viral_Monocytes", "Anti_Viral_Inflammatory_Monocytes",
+                                                                                          "Inflammatory_Monocytes",  "IFIhi_Monocytes",
+                                                                                          "Resting_Monocytes", "Non_Classical_Monocytes",
+                                                                                          "low_quali_Monocytes"))
+
+
+Idents(seurat_merge_mono) <- "monocyte_states"
+
+
+cluster.markers.wilcox <- FindAllMarkers(object = seurat_merge_mono, 
+                                         only.pos = TRUE, 
+                                         min.pct = 0.2, 
+                                         logfc.threshold = 0.25,
+                                         test.use = "wilcox"
+                                         )
+top <- cluster.markers.wilcox %>% group_by(cluster) %>% top_n(n = 5, wt = avg_log2FC)
+
+p <- DotPlot(seurat_merge_mono,
+        group.by = "monocyte_states", 
+        features = unique(top$gene))+ 
+  RotatedAxis()+ 
+  scale_color_gradientn(colors = rev(RColorBrewer::brewer.pal(n =20, name = "RdBu")))+
+  theme(axis.title = element_blank()) + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, face = "italic"))
+
+
+cairo_pdf("./Figures/20230117_scRNA_HIV_integrated_mono_marker.pdf", width = 10.5, height = 2.7)
+p
+dev.off()
+
+p
+
+```
+
+
+# Figure 3J
+
+
+```{r, fig.height=3.5, fig.width=5.5}
+marker.list<-list()
+
+DEG_anti_viral <- cluster.markers.wilcox[cluster.markers.wilcox$cluster == "Anti_Viral_Monocytes", ]
+DEG_anti_viral$Gene <- row.names(DEG_anti_viral)
+DEG_anti_viral <- DEG_anti_viral[DEG_anti_viral$p_val_adj < 0.05, ]
+
+dim(DEG_anti_viral)
+
+for(i in unique(DEG_anti_viral$cluster)){
+    marker.list[[paste0(i)]]<-DEG_anti_viral[DEG_anti_viral$cluster==i,]$Gene
+}
+
+GOEA_marker<-GOEA.of.list(seurat_object= seurat_merge_mono,
+             marker.list,
+             GeneSets =c("GO", "Hallmark"#, "Reactome","C_PATHWAYS"
+                         ),
+             GOntology = "BP",
+             pCorrection = "bonferroni",      # choose the p-value adjustment method (Steffi: bonferroni)
+             pvalueCutoff = 0.05,      # set the unadj. or adj. p-value cutoff (depending on correction method)
+             qvalueCutoff = 0.05       # set the q-value cutoff (FDR corrected)
+)
+
+#plot
+GSEA_comb <- rbind(GOEA_marker$HALLMARKresults, GOEA_marker$GOresults)
+
+
+GSEA_comb %>% group_by(Condition) %>% arrange(p.adjust, .by_group = TRUE) -> GSEA_comb
+GSEA_comb %>% group_by(Condition) %>% arrange(p.adjust, .by_group = TRUE) %>% top_n(n= 10, wt = Count) %>% pull(Description) -> terms
+GSEA_comb <- GSEA_comb[GSEA_comb$Description %in% terms,]
+GSEA_comb$Description <- ifelse(nchar(GSEA_comb$Description)>80,
+                        paste(substr(GSEA_comb$Description, 1, 80),"[...]",sep=""),
+                        GSEA_comb$Description)
+
+GSEA_comb <- GSEA_comb[order(GSEA_comb$Count, decreasing = T), ]
+GSEA_comb <- GSEA_comb[1:10, ]
+GSEA_comb$Description <- factor(GSEA_comb$Description, levels = rev(GSEA_comb$Description))
+
+p <- ggplot(GSEA_comb[GSEA_comb$Description %in% terms, ], aes(x = Count, y = Description, size = Count, color = p.adjust))+
+  geom_point()+theme_classic()+
+          theme_linedraw()+
+          theme(axis.text.y = element_text(color = "black"),
+                axis.text.x = element_text(angle=90, vjust=0.5,hjust=1, color = "black"),
+                text = element_text(size = 12))+
+          scale_fill_manual(values= c(up = "firebrick3", down = "dodgerblue2"))+
+          xlab("")+ylab("")+
+          #scale_size_area()
+          scale_radius()+
+    scale_colour_gradientn(colours=c('red',
+                                           'orange',
+                                           'darkblue',
+                                           'darkblue'),
+                                 limits=c(0,1),
+                                 values   = c(0,0.05,0.2,0.5,1),
+                                 breaks   = c(0.05,0.2,1),
+                                 labels = format(c(0.05,0.2,1))) +
+          ylab(NULL) +
+          theme_bw() +
+          theme(text = element_text(size=12), 
+                axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+cairo_pdf("./Figures/20230117_scRNA_HIV_GOEA_anti_viral_Monocytes.pdf", width = 5.5, height = 3.5)
+p
+dev.off()
+
+
+p
+        
+```
+
+# Figure S3G
+
+```{r, fig.width=13, fig.height=6}
+p <- DimPlot(subset(seurat_merge_mono, Patient %in% c("NL02", "NL04", "NL06", "NL08", "NL10")), group.by = "monocyte_states", split.by = "Patient", ncol = 3, cols = colors_mono_subtype)+NoLegend()
+
+seurat_merge_mono$Patient <- factor(seurat_merge_mono$Patient, levels = c("NL02", "NL04", "NL06", "NL08", "NL10",
+                                                                          "NL01", "NL03", "NL05", "NL07", "NL09"))
+
+
+p <- DimPlot(subset(seurat_merge_mono, Patient %in% c("NL02", "NL04", "NL06", "NL08", "NL10",
+                                                                          "NL01", "NL03", "NL05", "NL07", "NL09")), 
+             group.by = "monocyte_states", split.by = "Patient", ncol = 5, cols = colors_mono_subtype)+NoLegend()
+
+
+jpeg("./Figures/20230117_scRNA_HIV_integrated_mono_UMAP_all_Donors.jpeg", width = 13, height = 6, units = "in", res = 300)
+p
+dev.off()
+
+p
+
+```
+
+
+
+saving the clean and final object
+
+```{r}
+saveRDS(seurat_merge_mono, paste("seurat_merge_mono_final",Sys.Date(), ".RDS",sep=""))
+```
+
+
+
+# -----------------------
+
+# VI. intersection to in vitro drug
+
+# ------------------------
+
+# Figure S4A
+
+```{r, fig.width=4, fig.height=5}
+leading_edge_genes <- c("RTP4", "IFI27", "OAS1", "MX1", "CMPK2", "DDX60", "IFI44L", "KYNU", "RSAD2", "S100P", "TNFSF10", "HORMAD1", "IFI6", "KRT7", "MX2", "SAMD9L", "TMEM45B", "UBE2L6", "ABCA1", "C3", "CARD6", "GBP1", "IFI44", "IFIH1", "ISG15", "PTGES", "SERPINB2", "TRIM22", "XAF1", "AIM2", "ANKRD22", "BST2", "CCL5", "CD74", "CDA")
+
+seurat_chronic_mono <- subset(seurat_merge_mono, dataset %in% "chronic_HIV")
+
+seurat_chronic_mono <- AddModuleScore(seurat_chronic_mono, features = list(leading_edge_genes), name = "leading_edge_genes")
+
+df <- seurat_chronic_mono@meta.data[,c("Patient", "Status", "monocyte_states", "leading_edge_genes1")]
+df %>% group_by(monocyte_states) %>% summarize(mean = mean(leading_edge_genes1)) -> df.mean
+df <- merge(df.mean, df, by = "monocyte_states")
+
+df <- df[order(df$mean, decreasing = T), ]
+df$monocyte_states <- gsub(df$monocyte_states, pattern = "_Monocytes", replacement = "")
+df$monocyte_states <- factor(df$monocyte_states, unique(df$monocyte_states))
+
+p <- ggplot(df, aes(x = monocyte_states, y = leading_edge_genes1))+
+  geom_violin(aes(fill = mean))+
+  stat_summary(fun.y = median, geom='point', size = 10, colour = "black", shape = 95)+
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0)+
+  theme_classic()+
+  theme(panel.grid.major = element_line("white"),
+        panel.grid.minor = element_line("white"),
+        axis.title.y = element_text( size = 12),
+        axis.text.y = element_text( size = 12),
+        axis.title.x = element_text( size = 12),
+        axis.text.x = element_text( size = 12, angle = 90, hjust = 1, vjust = 0.5),
+        legend.text =  element_text( size = 12),
+        plot.title = element_text(size = 14, hjust = 0.5))+
+  xlab("")+
+  ylab("Module Score")+
+  ggtitle(label = "leading_edge_genes in chronic HIV monos", subtitle = paste("n genes = ", length(leading_edge_genes)))+
+  NoLegend()
+
+cairo_pdf("./Figures/20230118_scRNA_HIV_drug_leading_edge_enrichment.pdf", width = 4, height = 5)
+p
+dev.off()
+
+
+p
+
+```
+
+
+
+
+
+
+
+
+
+
+# Supplementary Table S2
+
+
+DEG calculation
+
+```{r}
+seurat_chronic_mono <- subset(seurat_merge_mono, dataset %in% "chronic_HIV")
+
+
+seurat_chronic_mono@meta.data$Cell_ID <-  row.names(seurat_chronic_mono@meta.data)
+
+DEG_list_HIV_vs_control <-list()
+
+meta <- seurat_chronic_mono@meta.data
+meta %>% group_by(monocyte_states, Status) %>% summarise(n = n()) %>% filter(n<500) %>% pull(monocyte_states) -> exclude
+celltype_to_show <- unique(seurat_chronic_mono$monocyte_states)[!unique((seurat_chronic_mono$monocyte_states)) %in% c(exclude)]
+
+
+
+for (x in celltype_to_show) {
+    print(paste("HIV_vs_control", x, sep="_"))
+    tmp_cell_type <- subset(seurat_chronic_mono, subset = monocyte_states %in% x)
+    tmp_cell_type <- SetIdent(tmp_cell_type, value = "Status")
+    tryCatch({
+        DEG<-FindMarkers(tmp_cell_type,
+                         ident.1 =  "HIV_pos",
+                         ident.2 = "control" , 
+                         min.pct = 0.1, 
+                         logfc.threshold = 0.25,
+                         test.use = "wilcox", 
+                         slot = "data",
+                         only.pos = F,
+                         verbose = F)
+        DEG$Gene <- rownames(DEG)
+        DEG$regulation <- ifelse(DEG$avg_log2FC<0, "down", "up")
+        DEG$cell_type <- paste(x)
+        DEG$comparison_severity <- paste("HIV_vs_control")
+        DEG$comparison <- paste("HIV_vs_control", x, sep="_")
+        DEG_list_HIV_vs_control[[paste("HIV_vs_control", x, sep="_")]] <- DEG
+      }, error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+      
+    }
+  
+DEG_df_HIV_vs_control <- do.call("rbind", DEG_list_HIV_vs_control)
+DEG_df_HIV_vs_control$comparison_reg <- paste(DEG_df_HIV_vs_control$comparison, DEG_df_HIV_vs_control$regulation, sep="-")
+
+DEG_df_HIV_vs_control_celltypes <- DEG_df_HIV_vs_control
+```
+
+change to recreate plot DEG figure 3
+
+
+```{r, fig.width=5, fig.height=4}
+data_sub <- DEG_df_HIV_vs_control_celltypes[DEG_df_HIV_vs_control_celltypes$cell_type %in% c("Resting_Monocytes", "Non_Classical_Monocytes"), ]
+
+
+data_sub$regulation <- factor(data_sub$regulation, levels = c("up", "down"))
+data_sub$cell_type <- factor(data_sub$cell_type, levels = c("Resting_Monocytes", "Non_Classical_Monocytes"))
+
+data_sub_signif <- data_sub[data_sub$p_val_adj < 0.05, ]
+
+data_sub_signif$regulation <- factor(data_sub_signif$regulation, levels = c("up", "down"))
+data_sub_signif$cell_type <- factor(data_sub_signif$cell_type, levels = c("Resting_Monocytes", "Non_Classical_Monocytes"))
+
+p <- ggplot(data_sub_signif, aes(x = regulation, fill = regulation))+
+          geom_bar(colour = "black")+
+          geom_text(stat='count', aes(label=..count..), vjust=-1)+
+          theme_bw() + 
+          facet_wrap(~cell_type, nrow = 1, scales = "free_x")+
+          theme(text = element_text(size = 14, color = "black"),
+                plot.title = element_text(size = 16),
+                axis.text.x =  element_text(angle = 60, hjust = 1, vjust = 1))+
+          xlab("")+
+          ggtitle("DEG (adj. p<0.05, log2FC = 0.25)")+
+          scale_fill_manual(values = c("up" = "#cb181d", "down" = "#4292c6"))+
+          ylim(c(0,70))
+
+p
+```
+
+
+
+
+Overlap PBMC and CD14
+
+```{r}
+saveRDS(data_sub_signif, file = "~/data/Analysis/Rainer/20230120_DEG_resting_non_classical_mono_scRNAseq_HIV_pilot.RDS")
+
+DEG_mono_resting <- data_sub_signif[data_sub_signif$cell_type == "Resting_Monocytes", ]
+DEG_mono_non_c <- data_sub_signif[data_sub_signif$cell_type == "Non_Classical_Monocytes", ]
+
+up_DEG_mono_resting <- DEG_mono_resting[DEG_mono_resting$avg_log2FC > 0, "Gene"]
+down_DEG_mono_resting <- DEG_mono_resting[DEG_mono_resting$avg_log2FC < 0, "Gene"]
+
+up_DEG_mono_non_c <- DEG_mono_non_c[DEG_mono_non_c$avg_log2FC > 0, "Gene"]
+down_DEG_mono_non_c <- DEG_mono_non_c[DEG_mono_non_c$avg_log2FC < 0, "Gene"]
+
+
+DEresults_cd14 <- readRDS("DEresults_cd14.RDS")
+
+up_DEG_CD14 <- DEresults_cd14$HIV_vs_ctrl@DE_genes$up_regulated_Genes
+down_DEG_CD14 <- DEresults_cd14$HIV_vs_ctrl@DE_genes$down_regulated_Genes
+
+
+length(intersect(up_DEG_mono_resting, up_DEG_CD14$SYMBOL))
+length(intersect(up_DEG_mono_non_c, up_DEG_CD14$SYMBOL))
+
+intersect(down_DEG_mono_resting, down_DEG_CD14$SYMBOL)
+intersect(down_DEG_mono_non_c, down_DEG_CD14$SYMBOL)
+
+```
+
+
+
+

@@ -1,0 +1,1094 @@
+---
+title: "HIV Pilot Drug in vitro verification"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Note that the `echo = FALSE` parameter is added to the code chunk to prevent printing of the R code that generated the plot.
+
+
+# 1) Load packages and functions
+
+First, we install all necessary CRAN and Bioconductor packages and load them into the R session.
+
+CRAN packages
+
+```{r}
+# CRAN packages
+list.of.packages <- c("tidyr",
+                      "ggplot2",
+                      "ggrepel",
+                      "gplots",
+                      "ggbeeswarm",
+                      "hexbin",
+                      "reshape2",
+                      "factoextra",
+                      "Hmisc",
+                      "VennDiagram",
+                      "openxlsx")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)>0) install.packages(new.packages)
+```
+
+BioConductor
+
+```{r}
+# BioconductoR packages
+list.of.bioc.packages<- c("rhdf5",
+                          "clusterProfiler",
+                          "DOSE",
+                          "GSEABase",
+                          "RColorBrewer",
+                          "ComplexHeatmap",
+                          "tximport",
+                          "DESeq2",
+                          "vsn",
+                          "pheatmap",
+                          "genefilter",
+                          "biomaRt",
+                          "limma",
+                          "sva",
+                          "IHW",
+                          "org.Hs.eg.db", "ggpubr", "GSVA")
+
+new.packages.bioc <- list.of.bioc.packages[!(list.of.bioc.packages %in% installed.packages()[,"Package"])]
+ 
+if(length(new.packages.bioc)>0)if (!requireNamespace("BiocManager")) install.packages("BiocManager")
+BiocManager::install(new.packages.bioc, update = FALSE)
+```
+
+Load Packages
+
+```{r load packages, results='hide',message=FALSE,warning=FALSE}
+lapply(c(list.of.packages,list.of.bioc.packages), require, character.only = TRUE)
+```
+
+Custom Functions
+
+```{r}
+source_rmd = function(file, skip_plots = TRUE) {
+  temp = tempfile(fileext=".R")
+  knitr::purl(file, output=temp)
+
+  if(skip_plots) {
+    old_dev = getOption('device')
+    options(device = function(...) {
+      .Call("R_GD_nullDevice", PACKAGE = "grDevices")
+    })
+  }
+  source(temp)
+  if(skip_plots) {
+    options(device = old_dev)
+  }
+}
+
+source_rmd("~/data/analysis/scripts/custom_functions_analysis.Rmd")
+```
+
+# 2) Project loadings
+
+Set organism and directory
+
+```{r}
+organism = "human" # choose "mouse" or "human"
+
+dir <- "~/data/analysis/"
+```
+
+Load gene annotation
+
+```{r gene annotation import}
+# Specify the filename of your gene annotation file here: 
+annotation_filename <- "ID2SYMBOL_gencode_v27_transcript.txt"
+
+tx_annotation <- read.delim(file.path(dir, "files/GMTfiles", annotation_filename), 
+                         header = F , 
+                         stringsAsFactors = F,
+                         col.names = c("GENEID", "TXNAME", "SYMBOL", "GENETYPE"))
+
+```
+
+Load gene set annotation
+
+```{r}
+# Transcription Factors
+
+# read human TF list
+TFlist_hs <- read.csv(file.path(dir, "files/GMTfiles", "20180317_TFlist_human_Lambert_Cell2018.csv"),
+                       stringsAsFactors = FALSE, 
+                       header = FALSE)[,1]
+# GO
+GO_hs <- read.delim(file.path(dir, "files/GMTfiles/GO_hg38p12_ensembl181121.txt"),header=TRUE,stringsAsFactors = FALSE,quote="")
+
+# KEGG
+KEGG_hs <- read.delim(file.path(dir, "files/GMTfiles/KEGG_hg38_clusterProfiler181121.txt"),header=TRUE,stringsAsFactors = FALSE)
+
+# MiSigDB gene sets
+hallmark_genes <- clusterProfiler::read.gmt(file.path(dir, "files/GMTfiles/h.all.v6.2.entrez.gmt"))
+```
+
+sample table
+
+```{r sample table import}
+sample_table <- read.xlsx(file.path(dir, "HIV_pilot_in_vitro_bulk_RNAseq.xlsx"))
+sample_table$ID_donor <- sample_table$ID
+sample_table$ID <- sample_table$lab_ID
+
+rownames(sample_table) <- sample_table$ID
+
+# exclusion of Metformin and Bezafibrate
+sample_table <- sample_table[sample_table$treatment %in% c("Doxycyclin",  
+                                            "Trametinib",   
+                                            "Sunitinib",    
+                                            "Sitagliptine", 
+                                            "Clofarabine",  
+                                            "DMSO"), ]
+
+
+```
+
+Format sample table
+
+```{r colour definitions}
+## Add columns with factors for comparisons in model
+sample_table$treatment <- factor(sample_table$treatment,
+                                 levels = c("Doxycyclin",  
+                                            "Trametinib",   
+                                            "Sunitinib",    
+                                            "Sitagliptine", 
+                                        #    "Metformine",  
+                                            "Clofarabine",  
+                                        #    "Bezafibrate", 
+                                            "DMSO"))
+```
+
+Color scheme
+
+Define you colour schemes according to your data set and your variables!
+
+For hex colors use: https://www.color-hex.com
+
+```{r}
+
+col_donor <- c("#7fc97f", "#beaed4", "#fdc086", "#ffff99", "#386cb0", "#f0027f")
+names(col_donor) <- c("RAD102", "RAD085", "ETZ101", "RAD072", "RAD107", "OLV224") 
+
+
+col_treatment <- c("#66c2a5","#fc8d62", "#8da0cb", "#e78ac3", "#a6d854", "#ffd92f", "#e5c494", "#b3b3b3")
+  
+names(col_treatment) <- c("Doxycyclin",  
+                                            "Trametinib",   
+                                            "Sunitinib",    
+                                            "Sitagliptine", 
+                                            "Metformine",  
+                                            "Clofarabine",  
+                                            "Bezafibrate", 
+                                            "DMSO")
+
+
+col_treatment <- col_treatment[c(1, 2, 3, 4, 6, 8)]
+
+col_origin <- c("orange", "lightblue", "lightgreen")
+names(col_origin) <- c("RAD", "ETZ", "OLV") 
+
+ann_colors <- list(donor = col_donor, 
+                 treatment =  col_treatment,
+                 origin = col_origin)
+
+```
+
+# 3) QC
+
+Fastq QC
+
+Read and visualize fastQC MultiQC output. 
+
+```{r MultiQC import}
+fastq_qc <- read.delim(file.path("~/data/alignment/2022-09-23--10-44-57/output/qc/multiqc/multiqc_data/multiqc_fastqc.txt"),
+                       stringsAsFactors = F)
+
+fastq_qc$ID <- unlist(lapply(strsplit(fastq_qc$Sample, split = "_"), `[[`, 6)) # sample identifiers
+
+fastq_qc$run <- unlist(lapply(strsplit(fastq_qc$Sample, split = "_"), `[[`, 8)) # run identifiers
+
+fastq_qc$lane <- unlist(lapply(strsplit(fastq_qc$Sample, split = "_"), `[[`, 9)) # lane identifiers
+
+rownames(fastq_qc) <- paste(fastq_qc$run, fastq_qc$ID, fastq_qc$lane, sep = "_")
+```
+
+Heatmap of fastQC quality checks
+
+Transposing data, e.g. in a data frame or matrix, is easy to do with the t() function. For example, if you want to transpose a data frame you can type t(data Frame). This will result in a new data frame that is obtained by exchanging the rows and columns. 
+
+```{r, fig.height=8, fig.width=15}
+
+fastQC_HC <- t(fastq_qc[,colnames(fastq_qc) %in% c("per_base_sequence_quality",
+                                              "per_sequence_quality_scores",
+                                              "per_base_sequence_content",
+                                              "per_sequence_gc_content",
+                                              "per_base_n_content",
+                                              "sequence_length_distribution",
+                                              "sequence_duplication_levels",
+                                              "overrepresented_sequences",
+                                              "adapter_content")])
+draw(Heatmap(fastQC_HC,
+        c("firebrick2", "forestgreen", "goldenrod1"),
+        column_title = "FastQC results"),
+     heatmap_legend_side = "left")
+
+```
+
+
+Kallisto QC
+
+Read  and visualize Kallisto MultiQC output.
+
+Before alignment, multiple fastq files from multiple lanes or runs for a single sample are merged and aligned as one sample. Thus, we have only one alignment score per sample. 
+
+Since we want to later visualize the alignment statistics in analysis plots, we add this information to our sample table.
+
+```{r Kallisto QC import}
+kallisto_qc <- read.delim(file.path("~/data/alignment/2022-09-23--10-44-57/output/kallisto/multiqc/multiqc_data/multiqc_kallisto.txt"), stringsAsFactors = F)
+
+# change sample column 
+kallisto_qc$Sample <- do.call(rbind, strsplit(kallisto_qc$Sample, split = "\\_"))[,1]
+
+# Merge kallisto QC to sample table
+sample_table <- merge(sample_table, kallisto_qc, by.x = "ID", by.y = "Sample")
+```
+
+Visualization of pseudoaligned and total reads
+
+```{r , fig.height=5 , fig.width=10}
+alignstat <-sample_table[,c("ID", "pseudoaligned_reads","total_reads")]
+
+alignstat <-gather(alignstat, "total_reads", "pseudoaligned_reads", key = "type", value = "reads")
+
+ggplot(alignstat, aes(x = reorder(ID,-reads), y = reads, fill = type)) + 
+  geom_bar(stat = "identity", position = "dodge", colour = "black") + 
+  scale_y_continuous(breaks = c(c(5 , 10, 25, 50, 100) * 10^6))+
+  scale_fill_manual(name = "", values = c("white", "grey")) + 
+  ylab("Reads") + 
+  xlab("Sample IDs") + 
+  geom_hline(yintercept=1 * 10^6, linetype="dashed", color = "red") +
+  ggtitle("Total reads and pseudoaligned reads") +
+  theme(axis.text.x = element_text(angle = 70, size = 9, hjust = 1, vjust = 1), 
+        strip.background = element_rect(fill = "white"), 
+        panel.background = element_rect(fill = "white", colour = "black"), 
+        legend.position = "bottom"
+  )
+
+```
+
+```{r, echo=FALSE}
+rm(alignstat)
+```
+
+Exclude samples after QC (based e.g. on number of unique alignments, percent of aligned reads?)
+
+In case, the data set contains samples of poor quality or simply to few reads, we might want to exclude these samples. In the following chunks, all samples with less than 5.000.000 reads are excluded from the subsequent analysis.
+
+```{r qc sample exclusion}
+# define read cutoff
+samples_to_keep <- sample_table[sample_table$pseudoaligned_reads > 1000000,]$ID
+
+# make reduced sampleTable file 
+sample_table <- sample_table[which(sample_table$ID %in% samples_to_keep),]
+rownames(sample_table) <- sample_table$ID
+```
+
+# 4) Creating the dataset
+
+TX import
+
+```{r kallisto import}
+# Define path where the Kallisto files are stored
+files <- paste("~/data/alignment/2022-09-23--10-44-57/output/kallisto/kallisto/", sample_table$ID, "/abundance.h5", sep = "")
+
+# Naming the entries in the vector assures correct column names in the expression tables
+names(files) <- sample_table$ID
+
+# Import samples and perform the distribution of transcripts to genes
+txi_kallisto <- tximport(files, 
+                         type="kallisto", 
+                         tx2gene=tx_annotation[,2:1])
+
+```
+
+# Figure S4A
+
+```{r, fig.width=4, fig.height=4}
+p <- ggplot(sample_table, aes(x = treatment, fill = treatment))+
+      geom_bar(stat = "count", color = "black")+
+      geom_text(stat='count', aes(label=..count..), vjust=3, size = 6)+
+      scale_fill_manual(values = col_treatment)+
+      theme_bw()+
+      theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 12), axis.text.y = element_text(size = 12))+
+      ylab("number of patients included")+
+      xlab("")
+
+p
+```
+
+
+Building the DEseqDataSet
+
+```{r DESeqDatasetFromTXimport}
+dds_txi <- DESeqDataSetFromTximport(txi = txi_kallisto, 
+                                    colData = sample_table,
+                                    design = ~ treatment)
+```
+
+Pre-filtering
+
+```{r pre-filtering}
+genes_to_keep <- rowSums(counts(dds_txi)) >= 10
+
+dds <- dds_txi[genes_to_keep,]
+```
+
+DESeq calculations
+
+```{r DESeq calculation}
+dds <- DESeq(dds)
+```
+
+Normalized count table  
+
+For inspection of the normalized data, we write the normalized counts into a data.frame called "norm_anno".
+
+```{r gene annotation}
+norm_anno <- as.data.frame(counts(dds, normalized=T))
+norm_anno$GENEID <- row.names(norm_anno)
+# add gene annotation extracted from the gtf file
+gene_annotation <- tx_annotation[!duplicated(tx_annotation$GENEID),c("GENEID", "SYMBOL", "GENETYPE")]
+gene_annotation <- gene_annotation[match(rownames(norm_anno), gene_annotation$GENEID),]
+# check if row names of the normalized table and the gene annotation match perfectly
+all(rownames(norm_anno) == gene_annotation$GENEID)
+# add additional gene annotation downloaded from biomart
+biomart <- read.delim("~/data/analysis/files/GMTfiles/biomart_190110_hg38.txt", stringsAsFactors = FALSE)
+idx <- match(unlist(lapply(strsplit(gene_annotation$GENEID, split = "[.]"), `[[`, 1)), biomart$Gene.stable.ID)
+gene_annotation$DESCRIPTION <- biomart$Gene.description[idx]
+gene_annotation$CHR <- biomart$Chromosome.scaffold.name[idx]
+# merge expression table and annotation
+norm_anno <- merge(norm_anno,
+                   gene_annotation,
+                   by = "GENEID")
+rownames(norm_anno) <- norm_anno$GENEID
+norm_anno[1:3,c(1:2, (ncol(norm_anno)-5):ncol(norm_anno))]
+```
+
+VST
+
+```{r vst}
+dds_vst <- vst(dds, blind = TRUE)
+```
+
+Plot row standard deviations versus row means
+
+```{r meanSdPlot, echo=TRUE}
+meanSdPlot(as.matrix(assay(dds_vst)), ranks = FALSE)
+```
+
+# 5) Exploratory Data Analysis
+
+Specify sample annotation for plotting
+```{r}
+# choose columns from sampletable for heatmap annotation
+plot_annotation <- sample_table[,c("treatment", "donor"), drop = F]
+rownames(plot_annotation) <- sample_table$ID
+```
+
+Frequencies of gene types
+
+```{r plot genetypes}
+TypeCounts <- as.data.frame(table(norm_anno$GENETYPE))
+
+colnames(TypeCounts) <- c("Type", "Frequency")
+
+TypeCounts <- subset(TypeCounts, Frequency>0)
+
+ggplot(TypeCounts, aes(x=Type, y= Frequency,  label=Frequency)) +
+  geom_bar(stat="identity",fill="grey",colour="grey") +
+  theme_bw()+
+  geom_text(size = 3, position = position_stack(vjust = 1))+
+  guides(fill=FALSE)+
+  theme(text = element_text(size=10),axis.text.x = element_text(angle =90, hjust = 1))+
+  xlab("")
+```
+
+Histogram of means per gene over all samples
+
+```{r}
+rMeans <- as.data.frame(log(rowMeans(counts(dds, normalized=TRUE)),10))
+colnames(rMeans) <- "rowMeans"
+ggplot(rMeans, aes(x = rowMeans)) + 
+  geom_histogram(bins=100) +
+  xlab("log10(rowMeans)")+
+  scale_x_continuous(breaks=c(0,1,2,3,4,5,6))+
+  theme_bw()
+```
+
+Boxplots of highest expressed genes
+
+```{r, fig.height=4, fig.width=8}
+highestGenes(numGenes = 10)
+```
+
+
+Principle Component Analysis 
+
+Percentage of explained variance of PCs
+
+```{r,  fig.height=5, fig.width=15}
+# Extract the eigenvalues/variances of the principal dimensions
+eigenvalue <- get_eig(prcomp(t(assay(dds_vst))))
+eigenvalue$dim <- as.numeric(c(1:nrow(eigenvalue)))
+ggplot(eigenvalue, aes(dim, variance.percent))+ 
+  geom_bar(stat = "identity")+
+  geom_line(aes(dim, variance.percent)) +
+  geom_point(aes(dim, variance.percent)) +
+  geom_line(aes(dim, cumulative.variance.percent), colour= "grey") + 
+  geom_point(aes(dim, cumulative.variance.percent), colour= "grey") + 
+  scale_x_continuous(breaks=c(1:nrow(eigenvalue)))+
+  xlab("Dimensions") +
+  ylab("Percentage of explained variances") +
+  theme_bw()
+```
+
+Plot PCA {.tabset .tabset-fade}
+
+```{r, fig.width=6, fig.height=5}
+
+plotPCA(ntop="all", 
+        xPC=1, 
+        yPC=2,
+        color="treatment",
+        anno_colour = col_treatment,
+        shape= "null",
+        point_size=5,
+        label= NULL,
+        title="Principle Component Analysis based on variance-stabilized counts")
+
+plotPCA(ntop="all", 
+        xPC=1, 
+        yPC=2,
+        color="donor",
+        anno_colour = col_donor,
+        shape= "null",
+        point_size=5,
+        label= NULL,
+        title="Principle Component Analysis based on variance-stabilized counts")
+
+
+plotPCA(ntop="all", 
+        xPC=1, 
+        yPC=2,
+        color="fragment_length",
+ #       anno_colour = col_donor,
+        shape= "null",
+        point_size=5,
+        label= NULL,
+        title="Principle Component Analysis based on variance-stabilized counts")
+```
+```{r}
+plotPCA(ntop="all", 
+        xPC=2, 
+        yPC=3,
+        color="donor",
+        anno_colour = col_donor,
+        shape= "null",
+        point_size=5,
+        label= NULL,
+        title="Principle Component Analysis based on variance-stabilized counts")
+
+plotPCA(ntop="all", 
+        xPC=3, 
+        yPC=4,
+        color="donor",
+        anno_colour = col_donor,
+        shape= "null",
+        point_size=5,
+        label= NULL,
+        title="Principle Component Analysis based on variance-stabilized counts")
+
+```
+
+
+Batch effect removal
+
+SVA
+
+```{r}
+# Format and filter the input
+dat <- counts(dds, normalized=TRUE)
+idx <- rowMeans(dat) > 1
+dat <- dat[idx,]
+mod  <- model.matrix(~ treatment, colData(dds))
+mod0 <- model.matrix(~   1, colData(dds))
+```
+
+```{r}
+svseq <- svaseq(dat,
+               mod,
+               mod0)
+svseq$sv
+```
+
+```{r}
+for (i in 1:ncol(svseq$sv)) {
+  sample_table[[paste0("SV",i)]]<- svseq$sv[,i]
+}
+```
+
+```{r}
+#START HERE
+#compute the PCA embedding outside the original function (optionally select the most variable features of the data)
+    select <- order(rowVars(as.matrix(assay(dds_vst))), decreasing=TRUE)[c(1:nrow(as.matrix(assay(dds_vst))))]
+    pca <- prcomp(t(as.matrix(assay(dds_vst))[select,]))
+    
+    #for batch-corrected data
+    #select <- order(rowVars(removedbatch_dds_vst), decreasing=TRUE)[c(1:nrow(removedbatch_dds_vst))]
+    #pca <- prcomp(t(as.matrix(removedbatch_dds_vst)[select,]))
+    
+df_pca<-as.data.frame(pca[["x"]])
+#preform analysis for contribution only for covid, to do that I will replace the parameters in healthy to NA
+# Calculate variance attributed to metadata
+M<-sample_table
+rownames(M)<-rownames(sample_table)
+#colnames(M)
+M<-M[,which(colnames(M) %in% c("date", "donor", "donor_num", "origin", "treatment", 
+                     "total_reads", "pseudoaligned_reads" , "not_pseudoaligned_reads" ,  "percent_aligned" , "fragment_length"))]
+for(i in colnames(M)){
+  if(length(unique(M[,i]))<2){
+    print(paste("exclude",i,sep=" "))
+  }
+}
+#df_pca<-df_pca[,c(1:5)]
+pc_adj_r_squared<-matrix(NA,ncol=dim(df_pca)[2],nrow=dim(M)[2])
+for(i in 1:dim(df_pca)[2]){
+  print(i)
+  for(j in 1:dim(M)[2])
+  {
+    pc_adj_r_squared[j,i]<-summary(lm(df_pca[,i]~M[,j], na.action=na.exclude))$adj.r.squared
+  }
+}
+#done
+pc_adj_r_squared<-as.data.frame(pc_adj_r_squared)
+colnames(pc_adj_r_squared)<-colnames(df_pca)
+rownames(pc_adj_r_squared)<-colnames(M)
+
+my_pc_r_df<-pc_adj_r_squared
+#my_pc_r_df<-my_pc_r_df[c(10:21),]
+rownames(my_pc_r_df)
+my_pc_r_df<-pc_adj_r_squared[,c(1:10)]
+#my_pc_r_df<-my_pc_r_df[c(3:nrow(my_pc_r_df)),]
+my_pc_r_df<-my_pc_r_df[order(my_pc_r_df$PC1,decreasing = TRUE),]
+pc_df_plot<-my_pc_r_df
+#pc_df_plot<-pc_df_plot[c( "Stim",  "genotype" ,"total_reads"      , #"pseudoaligned_reads","not_pseudoaligned_reads","percent_aligned" ),]
+paletteLength<-50
+my_palette <- colorRampPalette(c("blue", "white", "red"))(paletteLength)
+breakList <- c(seq(min(pc_df_plot), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(pc_df_plot)/paletteLength, max(pc_df_plot), length.out=floor(paletteLength/2)))
+
+PC_contribut<-pheatmap(data.matrix(pc_df_plot),
+         cluster_rows=F,
+         cluster_cols=F,
+         show_rownames=T,
+         show_colnames = T,
+         scale = "none",
+         main = 'PC contribution',
+         display_numbers = FALSE,
+         color= my_palette,
+         breaks = breakList)
+```
+
+# Figure 4E
+
+batch-effect visible for donor, date, fragment, origin and percent_aligned
+
+```{r, fig.width=6, fig.height=5}
+removedbatch_dds_vst <- limmaBatchEffectRemoval(input=dds_vst,
+                                                modelfactor = "treatment",
+                                                batchfactor = c("SV1", "SV2", "SV3", "SV4", "SV5", "SV6"),
+                                                batchfactor_2 = NULL)
+
+
+p <- plotPCA(pca_input = removedbatch_dds_vst,
+         ntop="all",
+         xPC=1,
+         yPC=2,
+         color="treatment",
+         anno_colour = col_treatment,
+         point_size=4,
+         title="PCA of batch-corrected counts")
+
+
+p
+```
+
+```{r batch-corrected matrix}
+# Data frame of log values
+removed_batch_anno_log <- removedbatch_dds_vst
+removed_batch_anno_log$GENEID <- rownames(removed_batch_anno_log)
+removed_batch_anno_log <- merge(removed_batch_anno_log, norm_anno[,c("GENEID","SYMBOL","GENETYPE","DESCRIPTION","CHR")], by="GENEID")
+rownames(removed_batch_anno_log) <- removed_batch_anno_log$GENEID
+
+# Data frame of unlog values
+removed_batch_anno <- 2^removedbatch_dds_vst
+removed_batch_anno$GENEID <- rownames(removed_batch_anno)
+removed_batch_anno <- merge(removed_batch_anno, norm_anno[,c("GENEID","SYMBOL","GENETYPE","DESCRIPTION","CHR")], by="GENEID")
+rownames(removed_batch_anno) <- removed_batch_anno$GENEID
+
+
+removed_batch_anno_log[1:3,c(1:2, (ncol(removed_batch_anno_log)-5):ncol(removed_batch_anno_log))]
+removed_batch_anno[1:3,c(1:2, (ncol(removed_batch_anno)-5):ncol(removed_batch_anno))]
+```
+
+
+Include batch effect variables into DESeq2 model
+
+```{r}
+ddssva <- dds
+ddssva$SV1 <- svseq$sv[,1]
+ddssva$SV2 <- svseq$sv[,2]
+ddssva$SV3 <- svseq$sv[,3]
+ddssva$SV4 <- svseq$sv[,4]
+ddssva$SV5 <- svseq$sv[,5]
+ddssva$SV6 <- svseq$sv[,6]
+
+design(ddssva) <- ~ SV1 + SV2 + SV3 + SV4 + SV5 + SV6 +  treatment
+ 
+dds <- DESeq(ddssva)
+```
+
+# 6) DE Analysis
+
+define comparisons
+
+```{r}
+comparison_table <- data.frame(comparison = c("Doxycyclin", "Trametinib", "Sunitinib",
+                                              "Sitagliptine", "Clofarabine"),
+
+                              control = c("DMSO", "DMSO", "DMSO", "DMSO", "DMSO"))
+```
+
+DE call
+
+```{r}
+DEresults <- DEAnalysis(condition = "treatment",
+                        alpha=0.05 ,
+                        lfcThreshold= 0,
+                        sigFC = 2,
+                        multiple_testing="IHW",
+                        shrinkage = FALSE,
+                        shrinkType="normal")
+```
+
+number of DEG
+
+```{r}
+DEcounts <- NULL
+for(i in 1:nrow(comparison_table)){
+  tmp <- unlist(DEresults[[1+i]]@Number_DE_genes)
+  DEcounts <- rbind(DEcounts, tmp)
+}
+rownames(DEcounts) <- names(DEresults)[-1]
+DEcounts
+```
+
+# Figure S4C
+
+```{r, fig.width=8, fig.height=4}
+tmp <- melt(DEcounts)
+colnames(tmp) <- c("comparison", "regulation", "freq")
+tmp$regulation <- gsub(tmp$regulation, pattern = "_regulated_Genes", replacement = "")
+tmp$comparison <- gsub(tmp$comparison, pattern = "_vs_DMSO", replacement = "")
+tmp$regulation <- factor(tmp$regulation, levels = c("up", "down"))
+
+tmp$comparison <- factor(tmp$comparison, levels = c("Sunitinib", "Doxycyclin", "Trametinib",  "Clofarabine", "Sitagliptine", "DMSO"))
+
+p <- ggplot(tmp, aes(x = regulation, y = freq, fill = regulation))+
+  geom_bar(stat = "identity", color = "black")+
+  facet_wrap(~comparison, ncol = 7)+
+  scale_fill_manual(values= c("#d53e4f", "#3288bd"))+
+  geom_text(aes(label=freq), vjust=-0.2)+
+  theme_bw()
+
+
+p
+```
+
+
+# Figure S4D
+
+top 10 DEG up/down of each drug (drug vs DMSO) as heatmap.
+
+```{r}
+for(i in names(DEresults)[2:6]){
+  
+  tmp <- DEresults[[i]]
+  tmp <- tmp@results
+  tmp <- tmp[tmp$GENETYPE == "protein_coding", ]
+  tmp <- tmp[tmp$padj < 0.05, ]
+  tmp <- tmp[tmp$regulation %in% c("up", "down"), ]
+  tmp <- tmp[order(tmp$padj, decreasing = F), ]
+
+  tmp_up <- tmp[tmp$regulation == "up", ]
+  tmp_down <- tmp[tmp$regulation == "down", ]
+  
+  tmp_up <- head(tmp_up, 20)
+  tmp_down <- head(tmp_down, 20)
+ 
+  tmp_top <- rbind(tmp_up, tmp_down)
+  
+  if(i == names(DEresults)[2]) top_all <- tmp_top
+  else top_all <- rbind(top_all, tmp_top)
+}
+
+length(unique(top_all$SYMBOL)) #61 unique DEG
+
+
+```
+
+```{r}
+plotHeatmap2 <- function(geneset,
+                    title="",
+                    keyType = "Ensembl",
+                    show_rownames = FALSE,
+                    cluster_cols = FALSE,
+                    font.size=7,
+                    max.value=2){
+  if(geneset[1] =="all"){
+    input <- removed_batch_anno_log
+  }else{
+    if(keyType == "Ensembl"){
+      input <- removed_batch_anno_log[removed_batch_anno_log$GENEID %in% geneset,]
+    } else if(keyType == "Symbol"){
+      input <- removed_batch_anno_log[removed_batch_anno_log$SYMBOL %in% geneset,]
+    } else{
+      print("Wrong keyType. Choose Ensembl or Symbol!")
+    }
+  }
+  rownames(input) <- paste(input$GENEID, ":", input$SYMBOL, sep="")
+  input <- input[,colnames(input) %in% sample_table$ID]
+  input_scale <- t(scale(t(input)))
+  input_scale <- input_scale[,order(sample_table[[plot_order]], decreasing = FALSE)]
+  pheatmap(input_scale,
+         main=title,
+         show_rownames=show_rownames,
+         show_colnames=TRUE,
+         cluster_cols = cluster_cols, 
+         fontsize = font.size,
+         annotation_col = plot_annotation,
+         annotation_colors = ann_colors,
+         breaks = scaleColors(data = input_scale, maxvalue = max.value)[["breaks"]], 
+         color = scaleColors(data = input_scale, maxvalue = max.value)[["color"]])
+}
+```
+
+
+```{r, fig.width=6, fig.height=12}
+plot_order <- "treatment"
+```
+
+
+```{r, fig.height=8, fig.width=10}
+allDEgenes <- unique(top_all$GENEID)
+input <- removed_batch_anno_log[removed_batch_anno_log$GENEID %in% allDEgenes,]
+rownames(input) <- paste(input$GENEID, ":", input$SYMBOL, sep="")
+input <- input[,colnames(input) %in% sample_table$ID]
+input_scale <- t(scale(t(input)))
+
+set.seed(1000)
+
+column_ha=HeatmapAnnotation(df=sample_table[,c("donor", "treatment"), drop = F], 
+                              name = "annotation",
+                              col = list(treatment=ann_colors$treatment,
+                                         donor = ann_colors$donor),
+                              gp = gpar(col = "black"))
+
+cluster_ha = rowAnnotation(row_anno = anno_empty(border = FALSE,
+                                      width = max_text_width(14) + unit(4, "mm")))
+
+
+data <- as.data.frame(input_scale)
+
+set.seed(1000)
+hm <- Heatmap(data, 
+        name = "expression, z-scaled",
+        col = colorRamp2(c(-2, 0, 2), c("#0000FF", "white", "#FF0000")), 
+        show_row_names = F,
+        show_column_names = T,
+        cluster_columns = T, 
+        cluster_rows = T, 
+        row_names_side = "left", 
+        column_title = "DEG top 20 up/down for each treatment comparison by padj",
+        border = T, 
+        top_annotation = column_ha,
+        column_split = sample_table[,c("treatment"), drop = F],
+        right_annotation = cluster_ha) 
+ 
+
+
+
+set.seed(1000)
+draw(hm)
+
+
+
+
+```
+
+# Figure 4F
+
+GSVA
+signatures to test
+
+```{r}
+# genes from leading edge drug prediction
+leading_edge_genes <- c("RTP4", "IFI27", "OAS1", "MX1", "CMPK2", "DDX60", "IFI44L", "KYNU", "RSAD2", "S100P", "TNFSF10", "HORMAD1", "IFI6", "KRT7", "MX2", "SAMD9L", "TMEM45B", "UBE2L6", "ABCA1", "C3", "CARD6", "GBP1", "IFI44", "IFIH1", "ISG15", "PTGES", "SERPINB2", "TRIM22", "XAF1", "AIM2", "ANKRD22", "BST2", "CCL5", "CD74", "CDA")
+
+# sub selection of interferon genes from drug prediciton
+leading_edge_ifi <- c("IFI27", "OAS1", "MX1", "IFI44L", "IFI6", "MX2", "GBP12", "IFI44", "IFIH1", "ISG15", "XAF1")
+
+# marker of scRNAseq data for anti-viral monocytes
+anti_viral_mono_genes <- readRDS("~/data/analysis/files/anti_viral_genes_Mono.RDS")
+anti_viral_mono_genes_top50 <- anti_viral_mono_genes[1:50]
+anti_viral_mono_genes_top100 <- anti_viral_mono_genes[1:100]
+
+# geneset interferon gamma response
+interferon_gamma_response <- clusterProfiler::read.gmt("~/data/analysis/files/HALLMARK_INTERFERON_GAMMA_RESPONSE.v2022.1.Hs.gmt")
+interferon_gamma_response <- interferon_gamma_response$gene
+
+# geneset inflammatory response
+inflammatory_response <- clusterProfiler::read.gmt("~/data/analysis/files/HALLMARK_INFLAMMATORY_RESPONSE.v2022.1.Hs.gmt")
+inflammatory_response <- inflammatory_response$gene
+
+# generate list
+signatures <- list(leading_edge = leading_edge_genes,
+                   anti_viral_mono_all = anti_viral_mono_genes,
+                   ifng_response = interferon_gamma_response,
+                   inflammatory_response = inflammatory_response)
+
+```
+
+```{r, fig.width=16, fig.height=6}
+sample_table$treatment <- factor(sample_table$treatment, levels = c("Sunitinib", "Doxycyclin", "Trametinib", "Clofarabine", "Sitagliptine",  "DMSO"))
+
+p <- GSVA_my_signatures(input = norm_anno,
+                   sample_table = sample_table,
+                   col_number = length(names(signatures)),
+                   my_signatures = signatures,
+                   method = "gsva",
+                   kcdf = "Gaussian",
+                   statistics = TRUE,
+                   comparisons =  list(c("Sunitinib"  ,  "DMSO"),
+                                       c("Doxycyclin" ,   "DMSO"),
+                                       c("Trametinib" ,   "DMSO"),
+                                        c("Clofarabine" ,   "DMSO"),
+                                       c("Sitagliptine" ,   "DMSO")
+                                      
+                                      ))
+              
+
+p
+```
+
+
+```{r, fig.width=8, fig.height=5}
+sample_table$treatment <- factor(sample_table$treatment, levels = c("Doxycyclin", "Trametinib", "Sunitinib",  "Clofarabine", "Sitagliptine",  "DMSO"))
+
+
+### GSVA
+input = norm_anno  # or rather removed_batch_anno?
+input = removed_batch_anno  # batch corrected data!
+
+sample_table = sample_table
+col_number = length(names(signatures))
+my_signatures = signatures
+method = "gsva"
+kcdf = "Gaussian"
+statistics = TRUE
+comparisons =  list(c("Doxycyclin" ,   "DMSO"),
+                   c("Trametinib" ,   "DMSO"),
+                   c("Sunitinib"  ,  "DMSO"),
+                    c("Clofarabine" ,   "DMSO"),
+                   c("Sitagliptine" ,   "DMSO")
+                                    )
+  
+  ## Select reference gene set & create signature list
+signature_list = list()
+for (i in names(my_signatures)) {
+    tmp=norm_anno[norm_anno$SYMBOL%in%my_signatures[[i]],]$GENEID
+    signature_list[[i]]<-tmp
+}
+  
+  
+## Rename column names for GSVA analysis
+
+# Reorder sample table to match the order of the count matrix
+count.matrix <- input[, colnames(input) %in% as.character(sample_table$ID)]
+idx <- match(colnames(count.matrix), as.character(sample_table$ID))
+sample_table_sorted <- sample_table[ idx,]
+# Ensure order are correct
+if (identical(colnames(count.matrix), as.character(sample_table_sorted$ID))){
+# Rename columns
+colnames(count.matrix) <- paste(sample_table_sorted$treatment, sample_table_sorted$donor, sep = "_")
+count.matrix <- as.matrix(count.matrix)
+
+
+
+## Perform GSVA
+result_GSVA <- gsva(expr = count.matrix, 
+                    gset.idx.list = signature_list, 
+                    method = method, 
+                    kcdf = kcdf, 
+                    verbose = T, 
+                    parallel.sz = 1)
+result_GSVA_melted <- melt(result_GSVA)
+result_GSVA_melted <- separate(result_GSVA_melted, "Var2", into = c("treatment", "donor"), sep = "_")
+
+result_GSVA_melted$treatment<-factor(result_GSVA_melted$treatment,levels = levels(sample_table$treatment))
+
+## Plot result
+p <- ggplot(result_GSVA_melted, aes(x = treatment, y = value, fill = treatment)) +
+  geom_boxplot(alpha = 0.5, outlier.colour = "white", outlier.size = 0.1) + 
+  geom_jitter(width = 0.3, size = 2, aes(fill = treatment), color = "black", pch = 21) +
+  scale_fill_manual(values = col_treatment) + 
+  facet_wrap(~Var1, scales = "free", ncol = col_number) + 
+  theme_light() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+        panel.background = element_blank(), axis.line = element_line(colour = "black"), 
+        strip.text = element_text(color = "black"), 
+        axis.text.x=element_text(angle=90,  vjust=0.5, hjust = 1),
+        text = element_text(size = 12, color = "black"),
+        legend.position = "none") +
+  ylab("Enrichment score") + 
+  xlab("") +
+  stat_compare_means(comparisons = comparisons, method = "t.test", label = "p.signif", size = 3)+
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 5))
+
+
+p
+
+} 
+
+  
+p
+
+```
+
+
+# Figure S4D
+
+make heatmap from signatures of Figure 4F
+
+```{r}
+all_genes <- unlist(signatures)
+all_genes <- unique(all_genes)
+
+for(i in names(DEresults)[2:6]){
+  
+  tmp <- DEresults[[i]]
+  tmp <- tmp@results
+  tmp <- tmp[tmp$SYMBOL %in% all_genes, ]
+  tmp <- tmp[tmp$padj < 0.05, ]
+  tmp <- tmp[tmp$regulation %in% c("down"), ]
+  
+  #tmp <- tmp[order(tmp$log2FoldChange, decreasing = F), ]
+  tmp <- tmp[order(tmp$padj, decreasing = F), ]
+
+  tmp_leading <- head(tmp, 20)
+
+  if(i == names(DEresults)[2]) tmp_leading_all <- tmp_leading
+  else tmp_leading_all <- rbind(tmp_leading_all, tmp_leading)
+}
+
+length(unique(tmp_leading_all$SYMBOL)) #41 unique DEG
+
+
+```
+
+```{r, fig.height=10, fig.width=14}
+allDEgenes <- unique(tmp_leading_all$SYMBOL)
+
+input <- removed_batch_anno_log[removed_batch_anno_log$SYMBOL %in% allDEgenes,]
+rownames(input) <- paste(input$GENEID, ":", input$SYMBOL, sep="")
+input <- input[,colnames(input) %in% sample_table$ID]
+input_scale <- t(scale(t(input)))
+
+set.seed(1000)
+
+column_ha=HeatmapAnnotation(df=sample_table[,c("donor", "treatment"), drop = F], 
+                              name = "annotation",
+                              col = list(treatment=ann_colors$treatment,
+                                         donor = ann_colors$donor),
+                              gp = gpar(col = "black"))
+
+cluster_ha = rowAnnotation(row_anno = anno_empty(border = FALSE,
+                                      width = max_text_width(14) + unit(4, "mm")))
+
+
+data <- as.data.frame(input_scale)
+
+set.seed(1000)
+hm <- Heatmap(data, 
+        name = "expression, z-scaled",
+        col = colorRamp2(c(-2, 0, 2), c("#0000FF", "white", "#FF0000")), 
+        show_row_names = T,
+        show_column_names = T,
+        cluster_columns = T, 
+        cluster_rows = T, 
+        row_names_side = "left", 
+        column_title = "DEG top 20 up/down for each treatment comparison by padj",
+        border = T, 
+        top_annotation = column_ha,
+        column_split = sample_table[,c("treatment"), drop = F],
+        right_annotation = cluster_ha) 
+ 
+
+set.seed(1000)
+draw(hm)
+
+
+
+
+
+
+```
+
+
+```{r}
+for(i in names(DEresults)[2:6]){
+  
+  tmp <- DEresults[[i]]
+  tmp <- tmp@results
+  tmp <- tmp[tmp$GENETYPE == "protein_coding", ]
+  tmp <- tmp[tmp$padj < 0.05, ]
+  tmp <- tmp[tmp$regulation %in% c("up", "down"), ]
+  tmp <- tmp[order(tmp$padj, decreasing = F), ]
+
+  tmp_up <- tmp[tmp$regulation == "up", ]
+  tmp_down <- tmp[tmp$regulation == "down", ]
+  
+  tmp_up <- head(tmp_up, 20)
+  tmp_down <- head(tmp_down, 20)
+ 
+  tmp_top <- rbind(tmp_up, tmp_down)
+  
+  if(i == names(DEresults)[2]) top_all <- tmp_top
+  else top_all <- rbind(top_all, tmp_top)
+}
+
+length(unique(top_all$SYMBOL)) #61 unique DEG
+
+
+```
+
+
